@@ -54,6 +54,11 @@ services:
       - "${MOSQUITTO_WS_PORT:-9001}:9001"     # MQTT over websockets (Leftenant join monitor, browser-side)
     volumes:
       - ./mosquitto:/mosquitto/config/:ro
+      # Where mosquitto.conf's `persistence true` actually writes. Without a
+      # volume the session state lives in the container's writable layer and is
+      # discarded with it, so a durable subscription would survive a broker
+      # restart but not a `docker compose up` that recreates the container.
+      - mosquitto-data:/mosquitto/data
 
   chirpstack:
     image: chirpstack/chirpstack:4
@@ -328,3 +333,4 @@ volumes:
   redisdata:
   eventsdata:
   shared:
+  mosquitto-data:
