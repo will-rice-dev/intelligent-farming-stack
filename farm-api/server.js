@@ -108,7 +108,10 @@ const middleware = postgraphile(
     ignoreIndexes: true,
 
     // ── client ergonomics ────────────────────────────────────────────────
-    enableCors: true, // the library spelling of the CLI's --cors
+    // Deliberately no `enableCors`. It is the library spelling of the CLI's
+    // --cors, and it answers `Access-Control-Allow-Origin: *` -- which would
+    // hand every page the operator's browser happens to load a readable view
+    // of every reading on the box. See the same-origin guard below.
     dynamicJson: true, // jsonb (device meta, event details) <-> GraphQL JSON
     enableQueryBatching: true,
     legacyRelations: 'omit',
@@ -143,12 +146,77 @@ const sourceDocument = JSON.stringify(
   2,
 );
 
+/**
+ * True for a request some *other* page's browser sent here.
+ *
+ * This API has no authentication: what keeps it private is the loopback bind,
+ * and a browser running on the operator's own machine is already inside it --
+ * that bind stops the LAN, not the page in front of them. Without a guard,
+ * any page they visit could read every reading and every device off
+ * 127.0.0.1.
+ *
+ * Dropping `enableCors` is most of the answer -- with no
+ * `Access-Control-Allow-Origin`, a cross-origin page cannot read the response
+ * -- but not all of it. PostGraphile mounts a urlencoded body parser beside
+ * the JSON one, and `application/x-www-form-urlencoded` is a CORS-simple
+ * content type, so a hostile page can POST `query=...` with no preflight and
+ * have it *executed*: a connection taken and a query run, blind, as fast as
+ * it cares to. Refusing the request is what stops that.
+ *
+ * The telemetry bridge's curation API refuses anything carrying an `Origin`
+ * at all, and can, because no browser is among its callers. This one ships
+ * GraphiQL, and browsers attach `Origin` to same-origin POSTs too -- so a
+ * blanket refusal would 403 GraphiQL against its own server. Hence the
+ * comparison: `Origin`'s host against the `Host` we were asked for. Real
+ * callers lose nothing -- curl and server-side clients send no `Origin`, and
+ * GraphiQL sends one that matches.
+ *
+ * An unparseable `Origin` is refused, which is the right answer for the
+ * literal `null` a sandboxed iframe or a `file://` page sends: opaque origin,
+ * no legitimate business here.
+ *
+ * Note what this does not stop: DNS rebinding. A page whose name resolves to
+ * this address is same-origin as far as the browser is concerned, and nothing
+ * here checks `Host` against an allowlist. Browsers' own local-network
+ * restrictions are the mitigation; the README says so rather than pretending
+ * otherwise.
+ */
+function isCrossOriginRequest(req) {
+  const origin = req.headers.origin;
+  if (typeof origin !== 'string' || origin.length === 0) {
+    return false; // not a browser, or a navigation -- nothing to refuse
+  }
+  const host = req.headers.host;
+  if (typeof host !== 'string' || host.length === 0) {
+    return true; // an Origin with no Host to compare it to: refuse
+  }
+  try {
+    return new URL(origin).host !== host;
+  } catch {
+    return true; // including `Origin: null`
+  }
+}
+
 const server = http.createServer((req, res) => {
   // On every response, including GraphQL results, GraphiQL, and errors: the
   // offer has to be reachable from wherever a user actually interacts with
   // this, not only from a page they might never load.
   res.setHeader('x-source', SOURCE_URL);
   res.setHeader('x-license', SOURCE_LICENSE);
+
+  // Before routing, so it covers GraphQL, GraphiQL, and the source document
+  // alike -- and after the headers above, so even the refusal carries the
+  // section 13 offer. A person opening this in a browser navigates to it and
+  // sends no `Origin`, so the offer stays reachable the way it is meant to be.
+  if (isCrossOriginRequest(req)) {
+    res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(
+      JSON.stringify({
+        errors: [{ message: 'This API does not serve cross-origin browser requests.' }],
+      }) + '\n',
+    );
+    return;
+  }
 
   const path = (req.url || '').split('?')[0];
   if (req.method === 'GET' && (path === '/' || path === '/source')) {

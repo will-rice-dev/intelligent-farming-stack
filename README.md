@@ -298,8 +298,12 @@ curl -s http://localhost:5051/graphql -H 'content-type: application/json' \
   -d '{"query":"{ allReadingLatests(first: 5) { nodes { deviceId metric valueNum measuredAt } } }"}'
 ```
 
-GraphiQL is at http://localhost:5051/graphiql (`FARM_API_GRAPHIQL=false` turns it off). The useful
-entry points:
+GraphiQL is at http://localhost:5051/graphiql (`FARM_API_GRAPHIQL=false` turns it off) and works
+because it is served from this same origin. A browser page served from anywhere *else* gets a 403:
+this API answers no cross-origin request, by design (see the security notes). `curl` and
+server-side clients send no `Origin` and are unaffected.
+
+The useful entry points:
 
 - **`allReadings`** — every per-metric reading. The table is partitioned by month; the API exposes
   the parent as one table and hides the partitions, so this is the whole history.
@@ -595,5 +599,13 @@ The `farm` profile adds three more, all off unless you name the profile:
   `SELECT` and nothing else, which is what makes it read-only by role rather than by convention —
   but the passwords are still `changeme-*` until you rotate them.
 - **`farmdata-api` is read-only but not unauthenticated-safe**: it exposes every reading and every
-  device to anyone who can reach it, with GraphiQL on by default. Loopback-bound; set
-  `FARM_API_GRAPHIQL=false` and put TLS in front before it goes anywhere else.
+  device to anyone who can reach it, with GraphiQL on by default. Loopback-bound for that reason —
+  and note that a loopback bind is a guard against the LAN, not against the operator's own browser,
+  which sits on the near side of it. So, like the curation API, it refuses cross-origin browser
+  requests: a page you happen to visit cannot read your farm's telemetry off `127.0.0.1`, and cannot
+  make this run queries blind either. GraphiQL still works, because the refusal compares `Origin`
+  against `Host` rather than refusing every `Origin` outright. What it does **not** stop is DNS
+  rebinding — a page whose name resolves to this address looks same-origin to the browser, and
+  nothing here pins `Host` to an allowlist; browsers' own local-network restrictions are the
+  mitigation. Before this goes anywhere but loopback it needs all three: TLS in front, real
+  authentication in front, and `FARM_API_GRAPHIQL=false`.
