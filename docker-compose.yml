@@ -284,6 +284,219 @@ services:
       events-schema-wait:
         condition: service_completed_successfully
 
+  # ── Farm telemetry store (opt-in via the `farm` profile) ──────────────────────
+  # The normalized telemetry path: ChirpStack's MQTT events become narrow
+  # per-metric readings in `farmdata`, each stamped with the property the device
+  # was on when it measured. This is a different thing from the event store
+  # above, which archives ChirpStack's own event shape verbatim; the two run
+  # side by side and neither reads the other.
+  #
+  # All four services below sit behind the `farm` profile, so nothing here is
+  # built or started unless it is named:
+  #   docker compose --profile farm up -d
+  # Tearing down needs the profile too, or these are left running:
+  #   docker compose --profile farm down
+  #
+  # THE IMAGES ARE NOT PUBLISHED YET. Three of the four are built in the
+  # telemetry-bridge repository and consumed here by tag from the local Docker
+  # image store — this stack does not build from a sibling checkout (and cannot;
+  # compose's git-URL build context breaks on Windows, the same reason Leftenant
+  # is built the way it is). Build them once, in a telemetry-bridge checkout:
+  #   npm run images:build
+  # Without that, `up` fails with "pull access denied for
+  # intelligent-farming/farm-postgres". See the README.
+  farm-postgres:
+    profiles: ["farm"]
+    image: ${FARM_POSTGRES_IMAGE:-intelligent-farming/farm-postgres:dev}
+    restart: unless-stopped
+    # postgres:18 plus pg_partman and PostGIS. The settings below are surfaced
+    # for the same reason events-postgres surfaces its own: changing
+    # shared_preload_libraries costs a restart, so the worker is preloaded from
+    # first boot even though it stays idle.
+    #
+    # pg_partman_bgw.dbname is deliberately EMPTY. Pointing the background
+    # worker at a database before the migration chain has installed pg_partman
+    # makes it fail every cycle and log at ERROR. Set it only against a database
+    # farmdata-migrate has already migrated at least once.
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=${FARM_POSTGRES_WAL_LEVEL:-replica}"
+      - "-c"
+      - "max_wal_senders=${FARM_POSTGRES_MAX_WAL_SENDERS:-10}"
+      - "-c"
+      - "max_replication_slots=${FARM_POSTGRES_MAX_REPLICATION_SLOTS:-10}"
+      - "-c"
+      - "max_slot_wal_keep_size=${FARM_POSTGRES_MAX_SLOT_WAL_KEEP_SIZE:-2GB}"
+      - "-c"
+      - "shared_preload_libraries=${FARM_POSTGRES_SHARED_PRELOAD:-pg_partman_bgw}"
+      - "-c"
+      - "pg_partman_bgw.dbname=${FARM_POSTGRES_PARTMAN_BGW_DBNAME:-}"
+    environment:
+      # The owning superuser: CREATE EXTENSION pg_partman requires one. The
+      # least-privilege roles the services actually connect as are created by
+      # the migration chain, and their login accounts by farmdata-migrate.
+      POSTGRES_USER: ${FARM_POSTGRES_USER:-farmdata_owner}
+      POSTGRES_PASSWORD: ${FARM_POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${FARM_POSTGRES_DB:-farmdata}
+      # Not a knob: initdb reads this once, at first boot, and editing it later
+      # has no effect on an existing volume. The builtin provider ties collation
+      # to the server version rather than the base image's libc, so a glibc bump
+      # cannot silently invalidate a text index; C is pinned explicitly so an
+      # unset value cannot inherit the image's own locale.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale-provider=builtin --builtin-locale=C.UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      # /var/lib/postgresql, NOT /var/lib/postgresql/data. From 18 the official
+      # image puts the cluster at /var/lib/postgresql/18/docker — inside this
+      # path rather than at its root. Mounting the old path leaves the cluster
+      # in the container's writable layer, where it is silently discarded on
+      # every recreate.
+      - farmdata:/var/lib/postgresql
+    ports:
+      # Loopback only, like the event store. 5436 rather than 5434 (that store)
+      # or 5435 (the telemetry-bridge repo's own dev harness), so all three can
+      # run side by side.
+      - "${FARM_POSTGRES_HOST_BIND:-127.0.0.1}:${FARM_POSTGRES_HOST_PORT:-5436}:5432"
+    healthcheck:
+      # Over TCP, not the unix socket. On first boot the entrypoint runs a
+      # temporary server that listens only on the socket, so a socket probe
+      # reports healthy in the middle of initdb and everything gated on this
+      # starts against a database that is about to be restarted.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # One-shot: brings the database up to the migration chain, mints the login
+  # users the two services below connect as, and loads the organization and
+  # property projections. Runs to completion and stays exited; compose restarts
+  # it on every `up`, which is intended — every step is idempotent, and a second
+  # run applies no migrations and rewrites the same rows.
+  #
+  # It carries the owning superuser's credential, which is why it is separate
+  # from the daemon: CREATE EXTENSION needs a superuser, and nothing
+  # long-running should hold one. A failure here leaves everything gated on it
+  # unstarted rather than running against a half-migrated database — read it
+  # with `docker compose logs farmdata-migrate`.
+  farmdata-migrate:
+    profiles: ["farm"]
+    image: ${FARMDATA_MIGRATE_IMAGE:-intelligent-farming/farmdata-migrate:dev}
+    restart: "no"
+    depends_on:
+      farm-postgres:
+        condition: service_healthy
+    environment:
+      # In-network address: the service name compose's DNS resolves, not the
+      # published loopback port. The migration tooling reads HOST_BIND as the
+      # client host, which is what lets its configuration file work unchanged.
+      FARM_POSTGRES_HOST_BIND: farm-postgres
+      FARM_POSTGRES_HOST_PORT: "5432"
+      FARM_POSTGRES_USER: ${FARM_POSTGRES_USER:-farmdata_owner}
+      FARM_POSTGRES_PASSWORD: ${FARM_POSTGRES_PASSWORD:-changeme}
+      FARM_POSTGRES_DB: ${FARM_POSTGRES_DB:-farmdata}
+      # The accounts the bridge and the GraphQL layer connect as. The chain
+      # creates only NOLOGIN group roles — carriers of privileges, not
+      # credentials — so these are minted here, each granted membership in
+      # exactly one of them. Bench placeholders; rotate for anything real.
+      FARM_BRIDGE_LOGIN_USER: ${FARM_BRIDGE_LOGIN_USER:-farmdata_bridge}
+      FARM_BRIDGE_LOGIN_PASSWORD: ${FARM_BRIDGE_LOGIN_PASSWORD:-changeme-bridge}
+      FARM_API_LOGIN_USER: ${FARM_API_LOGIN_USER:-farmdata_api}
+      FARM_API_LOGIN_PASSWORD: ${FARM_API_LOGIN_PASSWORD:-changeme-farm-api}
+      # A path inside the container: the mount below, not a host path.
+      FARM_PROJECTION_SEED: /seed/projection.json
+    volumes:
+      - ./farm/projection.json:/seed/projection.json:ro
+
+  # The bridge itself: consumes ChirpStack's MQTT events, writes normalized
+  # readings, mirrors the ChirpStack device list, and serves the farm-local
+  # curation API an operator uses to say where a device actually is.
+  telemetry-bridge:
+    profiles: ["farm"]
+    image: ${TELEMETRY_BRIDGE_IMAGE:-intelligent-farming/telemetry-bridge:dev}
+    restart: unless-stopped
+    # Wrapped, because the ChirpStack API key does not exist until the
+    # provisioner has minted it and is written only to the shared volume — no
+    # environment variable can carry it. The shim reads it, derives the default
+    # property from the same seed file the migration one-shot loaded, and execs
+    # the daemon. Invoked through sh so it does not need an executable bit.
+    entrypoint: ["/bin/sh", "/farm/bridge-entrypoint.sh"]
+    depends_on:
+      farmdata-migrate:
+        condition: service_completed_successfully
+      provisioner:
+        condition: service_completed_successfully
+      mosquitto:
+        condition: service_started
+      chirpstack-rest-api:
+        condition: service_started
+    environment:
+      # In-network addresses throughout — service names, not the host-side
+      # loopback ports these services publish.
+      FARM_BRIDGE_MQTT_URL: mqtt://mosquitto:1883
+      # One client id per broker: the session is persistent, so a second daemon
+      # using this id would take the session over and the two would disconnect
+      # each other in a loop. Never scale this service.
+      FARM_BRIDGE_CLIENT_ID: ${FARM_BRIDGE_CLIENT_ID:-telemetry-bridge}
+      FARM_BRIDGE_SIGNAL_HEALTH: ${FARM_BRIDGE_SIGNAL_HEALTH:-on}
+      # Connects as the minted login, not the owner: it is a member of
+      # bridge_writer and assumes that role for each transaction.
+      FARM_POSTGRES_HOST_BIND: farm-postgres
+      FARM_POSTGRES_HOST_PORT: "5432"
+      FARM_POSTGRES_USER: ${FARM_BRIDGE_LOGIN_USER:-farmdata_bridge}
+      FARM_POSTGRES_PASSWORD: ${FARM_BRIDGE_LOGIN_PASSWORD:-changeme-bridge}
+      FARM_POSTGRES_DB: ${FARM_POSTGRES_DB:-farmdata}
+      # Blank on purpose: the entrypoint derives it from farm/projection.json,
+      # so the UUID has exactly one authoritative copy. Set it to override.
+      FARM_BRIDGE_PROPERTY_ID: ${FARM_BRIDGE_PROPERTY_ID:-}
+      # The inventory reconciler. The key and tenant id come from the shared
+      # volume via the entrypoint; only the URL is knowable in advance.
+      FARM_BRIDGE_CHIRPSTACK_URL: http://chirpstack-rest-api:8090
+      FARM_BRIDGE_RECONCILE_INTERVAL_SECONDS: ${FARM_BRIDGE_RECONCILE_INTERVAL_SECONDS:-600}
+      FARM_BRIDGE_CHIRPSTACK_TIMEOUT_SECONDS: ${FARM_BRIDGE_CHIRPSTACK_TIMEOUT_SECONDS:-10}
+      # The curation API. On here, off in the daemon's own default: this file
+      # exists to serve the bridge, while a bare run on someone's workstation
+      # has no business opening an unauthenticated write API.
+      FARM_BRIDGE_CURATION_API: "on"
+      # 0.0.0.0 *inside the container*, which is not the same as exposing it —
+      # the published port below decides who can reach it, and stays on
+      # loopback. A container-internal loopback bind could not be published.
+      FARM_BRIDGE_CURATION_BIND: "0.0.0.0"
+      FARM_BRIDGE_CURATION_PORT: "8091"
+      FARM_BRIDGE_CURATION_LAG_DAYS: ${FARM_BRIDGE_CURATION_LAG_DAYS:-7}
+      FARM_BRIDGE_CURATION_CHECK_INTERVAL_SECONDS: ${FARM_BRIDGE_CURATION_CHECK_INTERVAL_SECONDS:-3600}
+    volumes:
+      - shared:/shared:ro                                    # the provisioner's config.json
+      - ./farm/bridge-entrypoint.sh:/farm/bridge-entrypoint.sh:ro
+      - ./farm/projection.json:/seed/projection.json:ro      # for the default-property derivation
+    ports:
+      # THIS RELEASE SERVES NO AUTHENTICATION AND NO TLS on the curation API.
+      # Loopback only; move that bind only behind both. 8092 rather than 8091,
+      # which the telemetry-bridge repo's own dev harness publishes.
+      - "${FARM_CURATION_HOST_BIND:-127.0.0.1}:${FARM_CURATION_HOST_PORT:-8092}:8091"
+
+  # ── Read-only GraphQL/GraphiQL over the farm telemetry store ──────────────────
+  farmdata-api:
+    profiles: ["farm"]
+    build: ./farm-api
+    restart: unless-stopped
+    environment:
+      # Connects as the minted farm_read member — read-only by role, not by
+      # convention. Creds via env (not CLI args) so they stay out of the
+      # container's process list, the same as events-api.
+      DATABASE_URL: postgres://${FARM_API_LOGIN_USER:-farmdata_api}:${FARM_API_LOGIN_PASSWORD:-changeme-farm-api}@farm-postgres:5432/${FARM_POSTGRES_DB:-farmdata}
+      API_GRAPHIQL: ${FARM_API_GRAPHIQL:-true}
+    ports:
+      - "${FARM_API_HOST_BIND:-127.0.0.1}:${FARM_API_HOST_PORT:-5051}:5000"
+    depends_on:
+      farm-postgres:
+        condition: service_healthy
+      # Load-bearing, not just ordering: PostGraphile introspects once at boot
+      # and watchPg is off, so a schema that arrives afterwards stays invisible
+      # until this container is restarted.
+      farmdata-migrate:
+        condition: service_completed_successfully
+
   # ── Mock sensors (demo data generator; opt-in via the `mock` profile) ─────────
   # Simulates a handful of real ag sensors: builds valid LoRaWAN uplinks (MIC +
   # encrypted payload) and pushes them to the gateway bridge over Semtech UDP,
@@ -334,3 +547,4 @@ volumes:
   eventsdata:
   shared:
   mosquitto-data:
+  farmdata:

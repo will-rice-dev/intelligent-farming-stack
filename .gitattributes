@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Intelligent Farming Foundation
+#
+# Shell scripts are bind-mounted into Linux containers and run by busybox sh,
+# which treats a trailing CR as part of the command. A checkout that converted
+# them to CRLF -- git's default on Windows, which this stack supports -- would
+# produce "not found" errors naming a command that is plainly there.
+*.sh text eol=lf
