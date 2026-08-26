@@ -28,11 +28,14 @@
 # dropped datagram is a transport flake, and asserting 23 devices exactly would
 # turn it into a red run that reads like a regression in the bridge.
 #
-# Which is why every recovery is asserted against the *archive* rather than
-# against where the bridge's own count stood before the failure. The mock fleet
-# publishes throughout, so "more than before" is met by the next uplink round
-# and would pass with everything the outage held silently discarded. Do not
-# simplify those back to a `-gt` on a prior count.
+# Which is also why no count carries a per-failure recovery assertion here.
+# The mock fleet publishes throughout, so any bar taken from a snapshot -- the
+# bridge's own prior count or the archive's -- is met by the next few uplink
+# rounds with everything the outage held silently discarded. The recoveries are
+# asserted by *identity* instead: the set of uplink ids the archive held when
+# the failure ended, every one of which has to reach farmdata. Fresh uplinks
+# are not in that set and so cannot satisfy it. Do not reduce those back to a
+# comparison of counts, in either direction.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -187,6 +190,53 @@ wait_for() {
   done
 }
 
+# Every uplink id ChirpStack's archive holds right now. The two stores share a
+# message identity, which is what makes a per-message comparison possible at
+# all: event_up's primary key is ChirpStack's deduplicationId, and that is
+# exactly what the bridge records as telemetry.ingest_event.source_event_id.
+archived_uplink_ids() {
+  events_psql "SELECT lower(deduplication_id::text) FROM event_up" | LC_ALL=C sort
+}
+
+# The same ids from the bridge's side. Tolerates a database that is not
+# answering: these are polled across a farm-postgres restart, where an empty
+# answer means "nothing captured yet", which is a reason to keep waiting rather
+# than to abort the script.
+captured_uplink_ids() {
+  farm_psql "SELECT lower(source_event_id) FROM telemetry.ingest_event WHERE event_type = 'up'" 2>/dev/null \
+    | LC_ALL=C sort || true
+}
+
+# How many ids are in a newline-separated list. `grep -c .` rather than `wc -l`
+# because an empty list is one empty line to printf and zero ids to this.
+id_count() {
+  printf '%s\n' "$1" | grep -c . || true
+}
+
+# Wait until every uplink id in $2 (a frozen, sorted list) has been captured by
+# the bridge.
+#
+# A count cannot carry this assertion while the fleet is publishing. The bar
+# would be a snapshot of a store that keeps growing, and this wait's own
+# timeout is worth several times anything an outage here can queue up -- ~23
+# uplinks per MOCK_INTERVAL_SECONDS against a backlog of at most a few rounds --
+# so a backlog discarded in its entirety is covered by fresh traffic and the
+# step passes on it. Naming the messages takes the fleet out of the assertion:
+# uplinks that are not in the set cannot satisfy the set.
+wait_for_capture_of() {
+  local what="$1" required="$2" timeout="${3:-180}"
+  local deadline=$(( $(date +%s) + timeout )) missing=""
+  while :; do
+    missing="$(LC_ALL=C comm -23 <(printf '%s\n' "$required") <(captured_uplink_ids))"
+    if [ -z "$missing" ]; then
+      echo "[farm-e2e] $what: every uplink the archive held has reached farmdata"
+      return 0
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] || fail "$what: waited ${timeout}s, $(id_count "$missing") uplink(s) ChirpStack archived never reached farmdata -- e.g. $(printf '%s\n' "$missing" | head -3 | tr '\n' ' ')"
+    sleep 2
+  done
+}
+
 # ── teardown ──────────────────────────────────────────────────────────────────
 
 started=0
@@ -264,13 +314,19 @@ echo "[farm-e2e] every metric resolves in the dictionary — the vocabulary is t
 # was lost between ChirpStack and farmdata. Both stores sit downstream of the
 # same ChirpStack, so a datagram that never arrived is missing from both and
 # the comparison still holds; a message the bridge dropped is missing from only
-# one, which is what this catches. The archive counts uplinks; the bridge
-# captures one ingest_event per uplink it consumed.
-archived="$(events_psql "SELECT count(*) FROM event_up")"
+# one, which is what this catches. Compared per message rather than by count,
+# so a red run names the uplinks that went missing -- and so that the shared
+# identity the three recovery steps below all rest on is proved here, before
+# any of them depends on it.
+archived_ids="$(archived_uplink_ids)"
+archived="$(id_count "$archived_ids")"
 captured="$(farm_psql "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'")"
 echo "[farm-e2e] ChirpStack archived ${archived} uplink(s); the bridge captured ${captured}"
-[ "$captured" -ge "$archived" ] \
-  || fail "the bridge captured fewer uplinks ($captured) than ChirpStack archived ($archived) -- messages were lost between the broker and farmdata"
+[ "$archived" -gt 0 ] || fail "ChirpStack archived no uplink at all -- nothing downstream of it can be asserted"
+missing="$(LC_ALL=C comm -23 <(printf '%s\n' "$archived_ids") <(captured_uplink_ids))"
+[ -z "$missing" ] \
+  || fail "$(id_count "$missing") uplink(s) ChirpStack archived are absent from farmdata -- messages were lost between the broker and farmdata: $(printf '%s\n' "$missing" | head -3 | tr '\n' ' ')"
+echo "[farm-e2e] every uplink ChirpStack archived is in farmdata"
 
 # ── GraphQL ───────────────────────────────────────────────────────────────────
 
@@ -394,17 +450,18 @@ grep -qE 'writer session: connection error|writer session: connect attempt|write
   || fail "the bridge logged no retry while the database was down -- it did not notice"
 echo "[farm-e2e] the bridge is retrying with the database stopped"
 
-# What ChirpStack had archived by the time the database came back, everything
-# the outage queued up included. Requiring the bridge to *reach* that, rather
-# than merely to pass where it stood, is what makes this a loss check instead of
-# a liveness one: the mock fleet never stopped publishing, so "more than before"
-# is satisfied by a single fresh uplink and would pass with the whole outage
-# dropped. Flake-immune for the same reason the cross-check above is -- a
-# datagram that never reached ChirpStack is missing from both stores.
-archived_at_recovery="$(events_psql "SELECT count(*) FROM event_up")"
+# Which uplinks ChirpStack had archived by the time the database came back,
+# everything the outage queued up included -- named, not counted. Every one of
+# them has to reach farmdata, which is a loss check rather than a liveness one
+# and stays one with the mock fleet publishing throughout: an uplink that
+# arrives after this snapshot is not in the set and so cannot stand in for one
+# that was dropped, which is exactly what a count bar allows. Flake-immune for
+# the same reason the cross-check above is -- a datagram that never reached
+# ChirpStack is in neither store, so it is in neither side of the comparison.
+required_ids="$(archived_uplink_ids)"
 docker compose start farm-postgres
-wait_for "uplinks captured after the database came back (archive held ${archived_at_recovery})" \
-  "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'" "-ge $archived_at_recovery" 180
+wait_for_capture_of "uplinks captured after the database came back (archive held $(id_count "$required_ids"))" \
+  "$required_ids" 180
 echo "[farm-e2e] the bridge resumed writing on its own — no restart needed"
 
 step "resilience: the bridge goes away while the broker keeps receiving"
@@ -414,14 +471,24 @@ docker compose stop telemetry-bridge
 # them. They are held by mosquitto for the bridge's persistent session; that
 # session is why the broker keeps them instead of discarding them.
 sleep $(( MOCK_INTERVAL_SECONDS * 3 ))
-# The whole backlog, as the archive counts it. This is where a floor was weakest:
-# a broker that had silently discarded the queue -- persistence off, the session
-# gone clean, max_queued_messages exhausted -- still passes "more than before" on
-# the next uplink round, having lost every message it was holding.
-archived_at_recovery="$(events_psql "SELECT count(*) FROM event_up")"
+# The whole backlog, named. This is the step where a count was weakest: a broker
+# that had silently discarded the queue -- persistence off, the session gone
+# clean, max_queued_messages exhausted -- reaches any snapshot count within a few
+# uplink rounds, having lost every message it was holding.
+#
+# It is also the one step whose backlog can be measured directly, since the
+# bridge is down while the database is up. Asserting it is non-empty matters:
+# a step with nothing to drain proves nothing, and until now would still have
+# gone green.
+required_ids="$(archived_uplink_ids)"
+backlog_ids="$(LC_ALL=C comm -23 <(printf '%s\n' "$required_ids") <(captured_uplink_ids))"
+backlog="$(id_count "$backlog_ids")"
+[ "$backlog" -gt 0 ] \
+  || fail "the broker was handed nothing to hold -- no uplink was archived while the bridge was down, so this step would prove nothing"
+echo "[farm-e2e] the broker is holding ${backlog} uplink(s) with nothing consuming them"
 docker compose start telemetry-bridge
-wait_for "backlog drained after the bridge came back (archive held ${archived_at_recovery})" \
-  "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'" "-ge $archived_at_recovery" 180
+wait_for_capture_of "backlog drained after the bridge came back (${backlog} uplink(s) queued behind it)" \
+  "$required_ids" 180
 echo "[farm-e2e] the broker held the backlog and the bridge drained it"
 
 step "resilience: the bridge is killed outright"
@@ -436,12 +503,14 @@ sleep "$MOCK_INTERVAL_SECONDS"
 # Taken after the sleep but before the `start`, so it covers what was abandoned
 # mid-write as well as what was published while nothing was consuming. If
 # Docker's restart policy already brought the bridge back and it is draining by
-# now, this is simply a number it has partly reached -- still the one it has to
-# arrive at.
-archived_at_recovery="$(events_psql "SELECT count(*) FROM event_up")"
+# now, this is simply a set it has partly caught up with -- still the one it has
+# to arrive at. That same restart is why the backlog is not asserted non-empty
+# here the way it is in the step above: the bridge may legitimately have drained
+# it before this line runs.
+required_ids="$(archived_uplink_ids)"
 docker compose start telemetry-bridge
-wait_for "uplinks captured after a SIGKILL (archive held ${archived_at_recovery})" \
-  "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'" "-ge $archived_at_recovery" 180
+wait_for_capture_of "uplinks captured after a SIGKILL (archive held $(id_count "$required_ids"))" \
+  "$required_ids" 180
 
 # Duplicates are structurally impossible -- the reading primary key is the
 # idempotency key -- so this is really a check that the constraint is doing
@@ -466,9 +535,15 @@ step "asserting nothing was lost across the three failures"
 # Polled rather than slept on. The bridge is serial and acks after commit, so it
 # is still draining what the broker held when the publisher stopped, and how long
 # that takes depends on how much the three outages queued up behind it.
-archived_after="$(events_psql "SELECT count(*) FROM event_up")"
-wait_for "uplinks captured once everything settled (archive holds ${archived_after})" \
-  "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'" "-ge $archived_after" 180
+#
+# Per message here too. The publisher is stopped by now, so a count would have
+# been sound at this one point in the script -- but only a set says *which*
+# uplink is missing when this goes red, and only a set cannot be satisfied by
+# the bridge having over-counted somewhere else.
+archived_ids_after="$(archived_uplink_ids)"
+archived_after="$(id_count "$archived_ids_after")"
+wait_for_capture_of "uplinks captured once everything settled (archive holds ${archived_after})" \
+  "$archived_ids_after" 180
 
 # ── the two stores stay independent ───────────────────────────────────────────
 

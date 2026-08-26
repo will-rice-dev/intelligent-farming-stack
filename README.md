@@ -299,19 +299,23 @@ answers GraphQL, a device is curated through the curation API, and the curation-
 asserted by its exit code. It then puts the path under the three failures it has to survive — the
 database stopped underneath it, the bridge stopped while the broker keeps receiving, and the bridge
 killed outright — and checks that ingestion resumes each time without duplicating a reading and
-without losing one. Each recovery has to bring the bridge's capture count up to what ChirpStack's
-own archive held at the moment the failure ended, so an outage's worth of messages quietly
-discarded fails the step rather than passing on the next uplink round.
+without losing one. Each recovery is asserted per message rather than by count: the uplink ids
+ChirpStack's archive held at the moment the failure ended all have to reach `farmdata`, and since
+the mock fleet publishes throughout, only a set can carry that — a count bar taken at the same
+moment is met by the next few uplink rounds with the whole backlog discarded. A red step names the
+uplinks that went missing.
 
 ```sh
 bash scripts/farm-e2e.sh              # tears the stack down afterwards
 FARM_E2E_KEEP=1 bash scripts/farm-e2e.sh   # leave it running (fast iteration)
 ```
 
-It takes a few minutes, most of it waiting on uplink rounds. Counts are asserted as floors and as a
-cross-check against what ChirpStack itself archived, never as exact fleet totals: `mock-sensors`
-sends one unacknowledged UDP datagram per uplink with no retransmit, so an occasional frame never
-reaches ChirpStack at all, and that is a transport flake rather than a bridge regression.
+It takes a few minutes, most of it waiting on uplink rounds. Counts are asserted as floors, never as
+exact fleet totals: `mock-sensors` sends one unacknowledged UDP datagram per uplink with no
+retransmit, so an occasional frame never reaches ChirpStack at all, and that is a transport flake
+rather than a bridge regression. What proves nothing was lost is the comparison against ChirpStack's
+own archive, which is flake-immune for the same reason — a datagram that never arrived is in neither
+store, so it is on neither side of it.
 
 The deterministic versions of those three failures — including a daemon killed in the exact window
 between its commit and the message's acknowledgment — live in the telemetry-bridge repo's own
