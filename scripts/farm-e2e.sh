@@ -190,6 +190,35 @@ wait_for() {
   done
 }
 
+# Wait until farmdata-api answers a real query again. A bounded retry rather
+# than a single curl on purpose: this service has no retry loop of its own --
+# it takes the connection error, exits, and comes back because it carries
+# `restart: unless-stopped` -- so it is legitimately unreachable for a few
+# seconds after the database returns, and Docker's restart backoff decides for
+# how many.
+#
+# It asserts the response body, not the port. With retryOnInitFail the process
+# stays up and listening while PostGraphile retries introspection in the
+# background, so a service answering nothing but errors passes any check that
+# stops at a connection or a status code. `graphql` is curl -fsS, which under
+# this script's `set -e` would abort rather than retry -- hence the `if`, where
+# errexit is suspended.
+wait_for_farm_graphql() {
+  local what="$1" timeout="${2:-120}"
+  local deadline=$(( $(date +%s) + timeout )) response="" last="no response at all"
+  while :; do
+    if response="$(graphql 'query { allReadings(first: 1) { nodes { deviceId metric } } allProperties { nodes { propertyId } } }' 2>/dev/null)"; then
+      if ! printf '%s' "$response" | grep -q '"errors"'; then
+        echo "[farm-e2e] $what: farmdata-api is answering GraphQL again"
+        return 0
+      fi
+      last="$response"
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] || fail "$what: farmdata-api did not answer GraphQL within ${timeout}s -- last: $last"
+    sleep 2
+  done
+}
+
 # Every uplink id ChirpStack's archive holds right now. The two stores share a
 # message identity, which is what makes a per-message comparison possible at
 # all: event_up's primary key is ChirpStack's deduplicationId, and that is
@@ -464,6 +493,14 @@ wait_for_capture_of "uplinks captured after the database came back (archive held
   "$required_ids" 180
 echo "[farm-e2e] the bridge resumed writing on its own — no restart needed"
 
+# The bridge is not the only service whose database this step pulled out from
+# under it. farmdata-api's only assertion is up top, before the outage, and
+# every check below reads farmdata through psql rather than through the API --
+# so a read API left dead by a database blip passes every remaining step. It
+# recovers by restarting, which is a fine answer for a stateless reader, but
+# that makes `restart: unless-stopped` load-bearing and nothing here proved it.
+wait_for_farm_graphql "farmdata-api after the database outage" 120
+
 step "resilience: the bridge goes away while the broker keeps receiving"
 
 docker compose stop telemetry-bridge
@@ -545,9 +582,9 @@ archived_after="$(id_count "$archived_ids_after")"
 wait_for_capture_of "uplinks captured once everything settled (archive holds ${archived_after})" \
   "$archived_ids_after" 180
 
-# ── the two stores stay independent ───────────────────────────────────────────
+# ── both read APIs still answer, and the two stores stay independent ──────────
 
-step "asserting the event archive is unaffected"
+step "asserting both read APIs still answer"
 
 [ "$archived_after" -ge "$archived" ] || fail "the event archive lost rows ($archived -> $archived_after)"
 curl -fsS -X POST -H 'Content-Type: application/json' \
@@ -555,6 +592,16 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   "$EVENTS_API_URL" >/dev/null \
   || fail "the event archive's GraphQL endpoint stopped answering"
 echo "[farm-e2e] the event archive still holds ${archived_after} uplink(s) and answers GraphQL"
+
+# events-postgres is never touched by any of the three failures, so the check
+# above proves the two stores stay independent rather than that this one
+# recovered. The farm store's API is the one that had its database pulled out
+# from under it, so the run exits with both read surfaces proven rather than
+# one proven at the start and one at the end. No retry here: it came back
+# during the database-outage step, which is where a failure to recover would
+# be attributable.
+assert_graphql_ok "farmdata-api once everything settled" \
+  "$(graphql 'query { allReadingLatests(first: 1) { nodes { deviceId metric valueNum } } }')"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 

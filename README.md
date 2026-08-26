@@ -305,6 +305,14 @@ the mock fleet publishes throughout, only a set can carry that — a count bar t
 moment is met by the next few uplink rounds with the whole backlog discarded. A red step names the
 uplinks that went missing.
 
+The database-outage step re-asserts `farmdata-api` itself as well, not only the store behind it.
+Every other check after a failure reads `farmdata` through `psql`, so a read API left dead by a
+database blip would pass the rest of the run — and unlike the bridge, it has no retry loop of its
+own: it takes the connection error, exits, and comes back only because it carries
+`restart: unless-stopped`. That policy is load-bearing, so something has to prove it. The check
+looks at the response body rather than the port, because PostGraphile stays up and listening while
+it retries introspection, answering nothing but errors.
+
 ```sh
 bash scripts/farm-e2e.sh              # tears the stack down afterwards
 FARM_E2E_KEEP=1 bash scripts/farm-e2e.sh   # leave it running (fast iteration)
