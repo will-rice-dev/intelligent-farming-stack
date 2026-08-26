@@ -167,6 +167,14 @@ json_field() {
 # no-errors case, which is the passing one, would be the one that aborts.
 assert_graphql_ok() {
   local label="$1" response="$2"
+  # An empty body is a failure, not a pass, and it has to be said explicitly.
+  # Every caller passes `$(graphql ...)`, which is `curl -fsS` -- and a command
+  # substitution that fails inside an *argument* does not trip errexit: bash
+  # discards its status and the function is simply handed "". Without this line
+  # an endpoint refusing connections outright reaches the grep below with
+  # nothing to match and is reported ok, which is exactly backwards for the one
+  # caller that exists to prove a service came back.
+  [ -n "$response" ] || fail "${label}: no response at all -- the endpoint did not answer"
   if printf '%s' "$response" | grep -q '"errors"'; then
     fail "GraphQL returned errors for ${label}: $response"
   fi
@@ -549,12 +557,26 @@ docker compose start telemetry-bridge
 wait_for_capture_of "uplinks captured after a SIGKILL (archive held $(id_count "$required_ids"))" \
   "$required_ids" 180
 
-# Duplicates are structurally impossible -- the reading primary key is the
-# idempotency key -- so this is really a check that the constraint is doing
-# what the design says it does, on rows a redelivery may well have replayed.
+# A guard on the schema, not an assertion about the bridge, and worth being
+# plain about which: `(device_id, metric, channel, measured_at)` *is*
+# telemetry.reading's primary key, so this query returns nothing whether or not
+# a single message was ever redelivered. What it would catch is a migration
+# that widened or dropped that key, which would take the whole idempotency
+# contract with it -- and this is the cheapest place that would notice.
+#
+# Whether the redelivery itself replayed clean is not observable from out here
+# at all. Every trace of one is collapsed by a primary key -- reading,
+# reading_latest, ingest_event and device_event all dedupe on conflict -- and
+# the daemon logs connection lifecycle, faults and shutdown but never its
+# counters, so no query and no log line here can tell a replay that was deduped
+# from a redelivery that never happened. Successful idempotence is silent by
+# construction. That assertion belongs where the counters can be read: the
+# telemetry-bridge repo's own db:exercise:resilience drives the consumer
+# in-process, kills it in the window between a commit and that message's PUBACK,
+# and asserts the redelivery lands envelopesReplayed 1 / readingsInserted 0.
 dupes="$(farm_psql "SELECT count(*) FROM (SELECT device_id, metric, channel, measured_at FROM telemetry.reading GROUP BY 1,2,3,4 HAVING count(*) > 1) d")"
-[ "$dupes" = "0" ] || fail "$dupes reading key(s) appear more than once"
-echo "[farm-e2e] no duplicate readings after a kill and a redelivery"
+[ "$dupes" = "0" ] || fail "$dupes reading key(s) appear more than once -- telemetry.reading's primary key is no longer enforcing idempotency"
+echo "[farm-e2e] the reading key is still unique — the constraint idempotency rests on is intact"
 
 step "stopping the mock fleet"
 docker compose --profile mock stop mock-sensors

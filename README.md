@@ -298,8 +298,8 @@ land as normalized, property-stamped readings, every metric resolves in the dict
 answers GraphQL, a device is curated through the curation API, and the curation-lag alarm is
 asserted by its exit code. It then puts the path under the three failures it has to survive — the
 database stopped underneath it, the bridge stopped while the broker keeps receiving, and the bridge
-killed outright — and checks that ingestion resumes each time without duplicating a reading and
-without losing one. Each recovery is asserted per message rather than by count: the uplink ids
+killed outright — and checks that ingestion resumes each time with nothing left behind. Each
+recovery is asserted per message rather than by count: the uplink ids
 ChirpStack's archive held at the moment the failure ended all have to reach `farmdata`, and since
 the mock fleet publishes throughout, only a set can carry that — a count bar taken at the same
 moment is met by the next few uplink rounds with the whole backlog discarded. A red step names the
@@ -329,6 +329,14 @@ The deterministic versions of those three failures — including a daemon killed
 between its commit and the message's acknowledgment — live in the telemetry-bridge repo's own
 `npm run db:exercise:resilience`, which can drive the consumer in-process. This script proves the
 same recoveries for the packaged daemon on the real ChirpStack path.
+
+That in-process form is also the only place a redelivery can be **observed**. Every trace of one is
+collapsed by a primary key — `reading`, `reading_latest`, `ingest_event` and `device_event` all
+dedupe on conflict — and the daemon logs connection lifecycle, faults and shutdown but never its
+counters, so from out here a replay that was deduped and a redelivery that never happened are
+indistinguishable. Successful idempotence is silent by construction. What this script can prove
+after the kill is that ingestion resumed and nothing was lost; that the replay wrote nothing twice
+is asserted in the bridge repo, against counters.
 
 ### Querying it
 
