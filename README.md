@@ -298,7 +298,10 @@ land as normalized, property-stamped readings, every metric resolves in the dict
 answers GraphQL, a device is curated through the curation API, and the curation-lag alarm is
 asserted by its exit code. It then puts the path under the three failures it has to survive — the
 database stopped underneath it, the bridge stopped while the broker keeps receiving, and the bridge
-killed outright — and checks that ingestion resumes each time without duplicating a reading.
+killed outright — and checks that ingestion resumes each time without duplicating a reading and
+without losing one. Each recovery has to bring the bridge's capture count up to what ChirpStack's
+own archive held at the moment the failure ended, so an outage's worth of messages quietly
+discarded fails the step rather than passing on the next uplink round.
 
 ```sh
 bash scripts/farm-e2e.sh              # tears the stack down afterwards

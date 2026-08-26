@@ -27,6 +27,12 @@
 # against what ChirpStack actually received, never an exact fleet total: a
 # dropped datagram is a transport flake, and asserting 23 devices exactly would
 # turn it into a red run that reads like a regression in the bridge.
+#
+# Which is why every recovery is asserted against the *archive* rather than
+# against where the bridge's own count stood before the failure. The mock fleet
+# publishes throughout, so "more than before" is met by the next uplink round
+# and would pass with everything the outage held silently discarded. Do not
+# simplify those back to a `-gt` on a prior count.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -363,7 +369,6 @@ step "resilience: the database goes away under a live bridge"
 
 docker compose --profile mock up -d mock-sensors
 sleep "$MOCK_INTERVAL_SECONDS"
-before_outage="$(farm_psql "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'")"
 
 # Where the bridge's log stood before the outage. `--tail 200` cannot stand in
 # for this: this script reuses an already-running profile, and on a reused bench
@@ -389,27 +394,38 @@ grep -qE 'writer session: connection error|writer session: connect attempt|write
   || fail "the bridge logged no retry while the database was down -- it did not notice"
 echo "[farm-e2e] the bridge is retrying with the database stopped"
 
+# What ChirpStack had archived by the time the database came back, everything
+# the outage queued up included. Requiring the bridge to *reach* that, rather
+# than merely to pass where it stood, is what makes this a loss check instead of
+# a liveness one: the mock fleet never stopped publishing, so "more than before"
+# is satisfied by a single fresh uplink and would pass with the whole outage
+# dropped. Flake-immune for the same reason the cross-check above is -- a
+# datagram that never reached ChirpStack is missing from both stores.
+archived_at_recovery="$(events_psql "SELECT count(*) FROM event_up")"
 docker compose start farm-postgres
-wait_for "uplinks captured after the database came back" \
-  "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'" "-gt $before_outage" 180
+wait_for "uplinks captured after the database came back (archive held ${archived_at_recovery})" \
+  "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'" "-ge $archived_at_recovery" 180
 echo "[farm-e2e] the bridge resumed writing on its own — no restart needed"
 
 step "resilience: the bridge goes away while the broker keeps receiving"
 
 docker compose stop telemetry-bridge
-before_backlog="$(farm_psql "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'")"
 # Long enough that several uplink rounds are published with nothing consuming
 # them. They are held by mosquitto for the bridge's persistent session; that
 # session is why the broker keeps them instead of discarding them.
 sleep $(( MOCK_INTERVAL_SECONDS * 3 ))
+# The whole backlog, as the archive counts it. This is where a floor was weakest:
+# a broker that had silently discarded the queue -- persistence off, the session
+# gone clean, max_queued_messages exhausted -- still passes "more than before" on
+# the next uplink round, having lost every message it was holding.
+archived_at_recovery="$(events_psql "SELECT count(*) FROM event_up")"
 docker compose start telemetry-bridge
-wait_for "backlog drained after the bridge came back" \
-  "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'" "-gt $before_backlog" 180
+wait_for "backlog drained after the bridge came back (archive held ${archived_at_recovery})" \
+  "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'" "-ge $archived_at_recovery" 180
 echo "[farm-e2e] the broker held the backlog and the bridge drained it"
 
 step "resilience: the bridge is killed outright"
 
-before_kill="$(farm_psql "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'")"
 # SIGKILL, so no shutdown path runs at all: whatever was mid-write is
 # abandoned without acknowledgment and the broker still holds it. The service
 # carries `restart: unless-stopped`, so Docker may well bring it back on its
@@ -417,9 +433,15 @@ before_kill="$(farm_psql "SELECT count(*) FROM telemetry.ingest_event WHERE even
 # `start` on an already-running container is a no-op either way.
 docker compose kill -s KILL telemetry-bridge
 sleep "$MOCK_INTERVAL_SECONDS"
+# Taken after the sleep but before the `start`, so it covers what was abandoned
+# mid-write as well as what was published while nothing was consuming. If
+# Docker's restart policy already brought the bridge back and it is draining by
+# now, this is simply a number it has partly reached -- still the one it has to
+# arrive at.
+archived_at_recovery="$(events_psql "SELECT count(*) FROM event_up")"
 docker compose start telemetry-bridge
-wait_for "uplinks captured after a SIGKILL" \
-  "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'" "-gt $before_kill" 180
+wait_for "uplinks captured after a SIGKILL (archive held ${archived_at_recovery})" \
+  "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'" "-ge $archived_at_recovery" 180
 
 # Duplicates are structurally impossible -- the reading primary key is the
 # idempotency key -- so this is really a check that the constraint is doing
@@ -432,11 +454,26 @@ step "stopping the mock fleet"
 docker compose --profile mock stop mock-sensors
 sleep 5
 
+# ── nothing was lost across the three failures ────────────────────────────────
+
+step "asserting nothing was lost across the three failures"
+
+# The captured-vs-archived comparison up top ran before any failure was injected.
+# This is that same assertion after all three of them, and it is the one that
+# holds regardless of which step a loss would be attributable to: whatever
+# ChirpStack received across the whole run, the bridge has.
+#
+# Polled rather than slept on. The bridge is serial and acks after commit, so it
+# is still draining what the broker held when the publisher stopped, and how long
+# that takes depends on how much the three outages queued up behind it.
+archived_after="$(events_psql "SELECT count(*) FROM event_up")"
+wait_for "uplinks captured once everything settled (archive holds ${archived_after})" \
+  "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'" "-ge $archived_after" 180
+
 # ── the two stores stay independent ───────────────────────────────────────────
 
 step "asserting the event archive is unaffected"
 
-archived_after="$(events_psql "SELECT count(*) FROM event_up")"
 [ "$archived_after" -ge "$archived" ] || fail "the event archive lost rows ($archived -> $archived_after)"
 curl -fsS -X POST -H 'Content-Type: application/json' \
   -d '{"query":"query { allEventUps(first: 1) { nodes { devEui fCnt } } }"}' \
