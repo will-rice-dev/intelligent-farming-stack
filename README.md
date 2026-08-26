@@ -291,6 +291,30 @@ which is intended — every step is idempotent, so a second run applies no migra
 the same rows. If the bridge or the API report *"dependency failed to start"*, that one-shot is
 where to look: `docker compose logs farmdata-migrate`.
 
+### Proving it end to end
+
+`scripts/farm-e2e.sh` boots the farm profile with the mock fleet and walks the whole path: uplinks
+land as normalized, property-stamped readings, every metric resolves in the dictionary, the store
+answers GraphQL, a device is curated through the curation API, and the curation-lag alarm is
+asserted by its exit code. It then puts the path under the three failures it has to survive — the
+database stopped underneath it, the bridge stopped while the broker keeps receiving, and the bridge
+killed outright — and checks that ingestion resumes each time without duplicating a reading.
+
+```sh
+bash scripts/farm-e2e.sh              # tears the stack down afterwards
+FARM_E2E_KEEP=1 bash scripts/farm-e2e.sh   # leave it running (fast iteration)
+```
+
+It takes a few minutes, most of it waiting on uplink rounds. Counts are asserted as floors and as a
+cross-check against what ChirpStack itself archived, never as exact fleet totals: `mock-sensors`
+sends one unacknowledged UDP datagram per uplink with no retransmit, so an occasional frame never
+reaches ChirpStack at all, and that is a transport flake rather than a bridge regression.
+
+The deterministic versions of those three failures — including a daemon killed in the exact window
+between its commit and the message's acknowledgment — live in the telemetry-bridge repo's own
+`npm run db:exercise:resilience`, which can drive the consumer in-process. This script proves the
+same recoveries for the packaged daemon on the real ChirpStack path.
+
 ### Querying it
 
 ```sh
@@ -335,6 +359,25 @@ curl -s -X POST http://localhost:8092/v1/devices/<device-id>/assignment \
 
 Re-sending an identical request answers `changed: false` rather than writing again. `GET /` lists
 every verb.
+
+Confirming a device is on the property it already defaulted to **is** a curation, not a no-op: until
+a person says so the placement was written by a machine, and the response says `confirmed_placement`
+precisely because the property did not change. That is the commonest thing an operator does here.
+
+### The curation-lag alarm
+
+The guard against readings being quietly attributed to the property a device defaulted to rather
+than the one it is really on. It reports auto-created devices that have gone more than
+`FARM_BRIDGE_CURATION_LAG_DAYS` (default 7) without anyone placing them, and it is a subcommand of
+the bridge rather than an endpoint, so a cron job or a monitor can read its exit code:
+
+```sh
+docker compose run --rm --no-deps telemetry-bridge curation-lag
+# 0 = nothing lagging · 2 = devices are lagging · 1 = the check itself failed
+```
+
+The same check also runs on a timer inside the daemon (`FARM_BRIDGE_CURATION_CHECK_INTERVAL_SECONDS`),
+where it writes the same report to the log.
 
 **Two things to know before pointing anything at it.** It serves no authentication and no TLS in
 this release, which is why it is published on loopback only. And any request carrying an `Origin`
