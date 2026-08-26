@@ -19,7 +19,8 @@ FROM graphile/postgraphile:4.14.0
 WORKDIR /postgraphile
 COPY server.js ./farm-server.js
 
-# Replaces the base image's `./cli.js`. The connection string and the GraphiQL
-# switch come from the environment, so no credential appears in the process
-# list — the same reason events-api passes DATABASE_URL rather than a CLI flag.
+# Replaces the base image's `./cli.js`. The connection settings and the
+# GraphiQL switch come from the environment, so no credential appears in the
+# process list — the same reason events-api passes its connection through the
+# environment rather than a CLI flag.
 ENTRYPOINT ["node", "/postgraphile/farm-server.js"]

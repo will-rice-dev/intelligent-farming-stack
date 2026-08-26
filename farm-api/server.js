@@ -70,13 +70,61 @@ const preserveDecimalsPlugin = makeAddInflectorsPlugin(
 const PORT = 5000;
 const HOST = '0.0.0.0'; // inside the container; FARM_API_HOST_BIND decides what is published
 
-if (!process.env.DATABASE_URL) {
-  console.error('farmdata-api: DATABASE_URL is not set');
+// The connection is assembled from discrete settings rather than from a URL,
+// and that is the point rather than a style preference. A URL has to be built
+// by string interpolation in docker-compose.yml, where nothing can escape the
+// password going into it -- and the login bootstrap that mints these accounts
+// accepts any password except NUL, while the README tells an operator to
+// rotate the placeholder. A rotated password carrying `/`, `#`, or `?` does
+// not fail the parse: it re-splits the URL, so `pg` ends up connecting to a
+// host named after the *username* and the operator gets an ENOTFOUND with
+// nothing in it pointing at quoting. Handed over as separate values, the
+// password is never parsed at all and any character is safe.
+//
+// PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE are `pg`'s own canonical names,
+// so this is the driver's documented input rather than a convention invented
+// here. They still arrive as environment variables, not CLI arguments, which
+// is what keeps the credential out of the container's process list -- the
+// same reason events-api passes one.
+//
+// DATABASE_URL still wins when it is set, so pointing this at some other
+// database stays a one-liner; it is the escape hatch rather than the norm.
+function resolveConnection(env) {
+  if (env.DATABASE_URL) {
+    return { config: { connectionString: env.DATABASE_URL }, missing: [] };
+  }
+
+  // Host, user, and database are required because `pg`'s defaults for them --
+  // localhost, the OS user, a database named after that user -- are never the
+  // right answer inside a container, and letting them apply would turn a
+  // missing setting into a confusing connection failure instead of a clear
+  // one. The port has a default worth having, and the password deliberately
+  // does not: an empty one produces a plain authentication error, which says
+  // enough on its own and leaves room for a deployment that authenticates
+  // some other way.
+  const missing = ['PGHOST', 'PGUSER', 'PGDATABASE'].filter((name) => !env[name]);
+  return {
+    missing,
+    config: {
+      host: env.PGHOST,
+      port: Number(env.PGPORT) || 5432,
+      user: env.PGUSER,
+      password: env.PGPASSWORD,
+      database: env.PGDATABASE,
+    },
+  };
+}
+
+const connection = resolveConnection(process.env);
+if (connection.missing.length > 0) {
+  console.error(
+    `farmdata-api: ${connection.missing.join(', ')} not set (or set DATABASE_URL instead)`,
+  );
   process.exit(1);
 }
 
 const middleware = postgraphile(
-  process.env.DATABASE_URL,
+  connection.config,
   // Both schemas the bridge fills. `sync` is deliberately omitted: it holds
   // export watermarks and replication heartbeats, which are bookkeeping for
   // the services themselves and not a product surface.
@@ -174,6 +222,15 @@ const sourceDocument = JSON.stringify(
  * An unparseable `Origin` is refused, which is the right answer for the
  * literal `null` a sandboxed iframe or a `file://` page sends: opaque origin,
  * no legitimate business here.
+ *
+ * Turning this into an allowlist later is not the one-line change it looks
+ * like, and it is not the first thing a hosted console would need. Letting a
+ * browser *read* an answer means real CORS on the way out -- echoing
+ * `Access-Control-Allow-Origin`, `Vary: Origin` so nothing caches one
+ * origin's answer for another, and an `OPTIONS` handler, since a JSON GraphQL
+ * POST is not CORS-simple and preflights. More to the point, this guard stands in for authentication
+ * rather than complementing it: an allowlist says which *page* may ask, never
+ * who is asking, so it must not land ahead of the auth that decides its shape.
  *
  * Note what this does not stop: DNS rebinding. A page whose name resolves to
  * this address is same-origin as far as the browser is concerned, and nothing

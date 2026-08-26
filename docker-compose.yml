@@ -484,7 +484,19 @@ services:
       # Connects as the minted farm_read member — read-only by role, not by
       # convention. Creds via env (not CLI args) so they stay out of the
       # container's process list, the same as events-api.
-      DATABASE_URL: postgres://${FARM_API_LOGIN_USER:-farmdata_api}:${FARM_API_LOGIN_PASSWORD:-changeme-farm-api}@farm-postgres:5432/${FARM_POSTGRES_DB:-farmdata}
+      #
+      # Discrete settings rather than a DATABASE_URL, deliberately: a URL has
+      # to be interpolated here, nothing in compose can escape what goes into
+      # it, and a rotated password carrying `/`, `#`, or `?` re-splits the URL
+      # instead of failing it — leaving `pg` connecting to a host named after
+      # the username. These are pg's own canonical variable names, so the
+      # password is handed over as a value and never parsed. server.js still
+      # honors DATABASE_URL when one is set, for pointing this elsewhere.
+      PGHOST: farm-postgres
+      PGPORT: "5432"
+      PGUSER: ${FARM_API_LOGIN_USER:-farmdata_api}
+      PGPASSWORD: ${FARM_API_LOGIN_PASSWORD:-changeme-farm-api}
+      PGDATABASE: ${FARM_POSTGRES_DB:-farmdata}
       API_GRAPHIQL: ${FARM_API_GRAPHIQL:-true}
     ports:
       - "${FARM_API_HOST_BIND:-127.0.0.1}:${FARM_API_HOST_PORT:-5051}:5000"
