@@ -365,10 +365,27 @@ docker compose --profile mock up -d mock-sensors
 sleep "$MOCK_INTERVAL_SECONDS"
 before_outage="$(farm_psql "SELECT count(*) FROM telemetry.ingest_event WHERE event_type = 'up'")"
 
+# Where the bridge's log stood before the outage. `--tail 200` cannot stand in
+# for this: this script reuses an already-running profile, and on a reused bench
+# that window still holds the previous run's retry lines -- so the assertion
+# would pass on evidence from an outage that ended before this run started.
+log_mark="$(docker compose logs --no-color telemetry-bridge | wc -l | tr -d ' ')"
+
 docker compose stop farm-postgres
 sleep "$MOCK_INTERVAL_SECONDS"
-docker compose logs --no-color --tail 200 telemetry-bridge \
-  | grep -qE 'writer session: connect attempt|write failed .*retrying' \
+
+# Read into a variable rather than piped into `grep -q`. `grep -q` exits at its
+# first match; with that match early in the stream `docker compose logs` is
+# still writing, takes EPIPE and exits 255, and `pipefail` returns *that* --
+# failing the step even though the pattern was found. Command substitution
+# reads to the end, so the status reaching `||` is the one that means something.
+outage_log="$(docker compose logs --no-color telemetry-bridge | tail -n "+$((log_mark + 1))")"
+
+# Three lines, in the order the bridge can emit them. `connection error` comes
+# off the writer session's own socket the moment Postgres goes down; the other
+# two only appear once the next uplink is written, so matching on those alone
+# makes this depend on the mock fleet's cadence beating the sleep above.
+grep -qE 'writer session: connection error|writer session: connect attempt|write failed .*retrying' <<<"$outage_log" \
   || fail "the bridge logged no retry while the database was down -- it did not notice"
 echo "[farm-e2e] the bridge is retrying with the database stopped"
 
