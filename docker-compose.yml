@@ -59,6 +59,20 @@ services:
       # discarded with it, so a durable subscription would survive a broker
       # restart but not a `docker compose up` that recreates the container.
       - mosquitto-data:/mosquitto/data
+    # The broker has no readiness signal of its own otherwise, and two things
+    # want one: `up --wait` gating the bridge on a broker that is actually
+    # accepting connections, and scripts/farm-e2e.sh waiting for one it has just
+    # restarted or killed. A publish is the probe rather than an open port --
+    # mosquitto binds the listener before it has finished reading its own
+    # persisted sessions. Anonymous, so it needs no credential; QoS 0 and a
+    # throwaway topic, so it queues for nobody and the auto-generated client id
+    # cannot collide with the bridge's persistent session.
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_pub -h 127.0.0.1 -p 1883 -t healthcheck -m ping -q 0"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
 
   chirpstack:
     image: chirpstack/chirpstack:4
@@ -426,8 +440,12 @@ services:
         condition: service_completed_successfully
       provisioner:
         condition: service_completed_successfully
+      # Healthy rather than started: this is the one service whose persistent
+      # session the broker has to be ready to restore before it connects. The
+      # gateway bridges and ChirpStack stay on `service_started` -- they publish,
+      # so a broker that is a second behind costs them a retry, not a session.
       mosquitto:
-        condition: service_started
+        condition: service_healthy
       chirpstack-rest-api:
         condition: service_started
     environment:
