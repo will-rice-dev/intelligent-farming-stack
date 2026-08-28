@@ -6,7 +6,9 @@
 # ChirpStack and mosquitto into the telemetry bridge, landing as normalized,
 # property-stamped readings in farmdata, queryable over GraphQL, with a device
 # curated through the curation API and the curation-lag alarm asserted by its
-# exit code. Then the same path put under three failures it has to survive.
+# exit code. Then the same path put under six failures it has to survive --
+# three in the consumer and its database, three in the broker holding the queue
+# that the first three depend on.
 #
 # The sibling scripts/e2e.sh proves the *event archive* path (mock-sensors ->
 # ChirpStack -> the PostgreSQL integration -> events-api). This one proves the
@@ -36,6 +38,17 @@
 # the failure ended, every one of which has to reach farmdata. Fresh uplinks
 # are not in that set and so cannot satisfy it. Do not reduce those back to a
 # comparison of counts, in either direction.
+#
+# The three broker failures need one more thing said about them. Nothing is
+# published *through* a broker that is down: the gateway bridges reach ChirpStack
+# over mosquitto too, so while it is stopped ChirpStack receives nothing and
+# archives nothing, and both stores go quiet together. That is what keeps the
+# comparison honest across a broker outage -- an uplink lost in that window is
+# missing from both sides of it, exactly like a dropped datagram. What a broker
+# outage can genuinely cost is the backlog it was already holding, and those
+# uplinks *are* in the archive, because ChirpStack wrote them there before the
+# broker died. So the set frozen before a broker step is precisely the set at
+# risk, and a lost queue shows up as a named, attributable failure.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -225,6 +238,50 @@ wait_for_farm_graphql() {
     [ "$(date +%s)" -lt "$deadline" ] || fail "$what: farmdata-api did not answer GraphQL within ${timeout}s -- last: $last"
     sleep 2
   done
+}
+
+# Waits until the broker is accepting connections again.
+#
+# A restarted container is not a ready broker -- mosquitto binds its listener
+# before it has finished reading back its persisted sessions, and `compose start`
+# returns as soon as the container is running either way. So the probe is a
+# connection, not a port. It is the same probe the service's healthcheck uses,
+# run from here because these steps need to wait on it at a moment of their own
+# choosing rather than only at boot.
+#
+# mosquitto_pub with no -i generates its own client id and connects with a clean
+# session, which is the point: MQTT hands a client id to whoever connected with
+# it most recently, so a probe borrowing the bridge's would evict the very
+# persistent session these steps are asserting on.
+wait_for_broker() {
+  local what="$1" timeout="${2:-60}"
+  local deadline=$(( $(date +%s) + timeout ))
+  while :; do
+    if docker compose exec -T mosquitto \
+         mosquitto_pub -h 127.0.0.1 -p 1883 -t healthcheck/farm-e2e -m ping -q 0 >/dev/null 2>&1; then
+      echo "[farm-e2e] $what: the broker is accepting connections again"
+      return 0
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] || fail "$what: the broker did not accept a connection within ${timeout}s"
+    sleep 1
+  done
+}
+
+# The interval mosquitto is configured to checkpoint its session database at,
+# read from the config rather than repeated here.
+#
+# It is the bound on what an unclean broker death may discard, and the whole
+# reason the "killed outright" step below can assert no loss at all: persistence
+# is a periodic checkpoint, not a journal, so with no interval set the window is
+# mosquitto's 1800s default and nothing queued in the last half hour is on disk.
+# A step carrying its own copy of the number would keep passing after someone
+# changed the real one.
+broker_autosave_seconds() {
+  local seconds
+  seconds="$(awk '/^autosave_interval[[:space:]]+[0-9]+[[:space:]]*$/ { print $2 }' mosquitto/mosquitto.conf)"
+  [ -n "$seconds" ] \
+    || fail "mosquitto/mosquitto.conf sets no autosave_interval, so mosquitto's 1800s default applies and an unclean broker death has no bounded cost for this step to assert"
+  printf '%s' "$seconds"
 }
 
 # Every uplink id ChirpStack's archive holds right now. The two stores share a
@@ -578,16 +635,171 @@ dupes="$(farm_psql "SELECT count(*) FROM (SELECT device_id, metric, channel, mea
 [ "$dupes" = "0" ] || fail "$dupes reading key(s) appear more than once -- telemetry.reading's primary key is no longer enforcing idempotency"
 echo "[farm-e2e] the reading key is still unique — the constraint idempotency rests on is intact"
 
+# ── resilience, the broker itself ─────────────────────────────────────────────
+#
+# The three steps above all leave mosquitto standing, which makes it the one leg
+# of this that nothing had tested -- and the load-bearing one: the bridge holds
+# nothing in its own process -- it acknowledges after committing and leans on the
+# broker's persistent-session queue as the buffer -- so the broker's durability
+# *is* the "an outage costs latency, not data" guarantee rather than a detail of
+# it.
+#
+# Three failures, in increasing severity. The deterministic versions live in the
+# telemetry-bridge repo's own db:exercise:resilience, which can read the CONNACK's
+# session-present flag and the writer's counters; what these add is the packaged
+# daemon meeting the same failures on the real ChirpStack path.
+
+step "resilience: the broker restarts under a live bridge"
+
+# The one an operator actually causes -- upgrading or restarting the broker on a
+# running box. The queue is near-empty here, because the bridge is up and acking
+# promptly, so what is under test is the reconnect: a client that already
+# believes it is subscribed, attaching to a broker that has just come back.
+log_mark="$(docker compose logs --no-color telemetry-bridge | wc -l | tr -d ' ')"
+
+docker compose restart mosquitto
+wait_for_broker "after a clean broker restart"
+
+# Read into a variable and matched with a here-string, for the reason the
+# database-outage step above spells out: `grep -q` exits at its first match, and
+# with that match early in the stream `docker compose logs` takes EPIPE, exits
+# 255, and pipefail returns *that*.
+#
+# Polled rather than read once. The bridge reconnects on its own timer, so the
+# lines below arrive a second or two after the broker does.
+reconnect_deadline=$(( $(date +%s) + 60 ))
+while :; do
+  bridge_log="$(docker compose logs --no-color telemetry-bridge | tail -n "+$((log_mark + 1))")"
+  if grep -qE 'broker unreachable|reconnecting to the broker|connected to .* as "' <<<"$bridge_log"; then
+    break
+  fi
+  [ "$(date +%s)" -lt "$reconnect_deadline" ] \
+    || fail "the bridge logged nothing about the broker going away and coming back -- it did not notice"
+  sleep 2
+done
+echo "[farm-e2e] the bridge noticed the broker restart and reconnected"
+
+# Everything the archive holds now has to reach farmdata. Uplinks published
+# while the broker was down reached neither store -- the gateway bridges publish
+# through mosquitto too -- so they are on neither side of this comparison.
+#
+# An in-flight message delivered but not yet acknowledged when the socket died is
+# redelivered on the reconnect, so this step exercises the writer's idempotency
+# path as a side effect. It cannot *observe* that from out here, for the reason
+# the kill step above explains, but a replay that wrote twice would break the
+# primary-key guard at the end of that step.
+required_ids="$(archived_uplink_ids)"
+wait_for_capture_of "uplinks captured after a broker restart (archive held $(id_count "$required_ids"))" \
+  "$required_ids" 180
+
+step "resilience: the broker restarts with a backlog queued"
+
+# Now the durability claim itself. The bridge goes away first so the broker has
+# something to hold, and then the thing holding it is restarted underneath it.
+docker compose stop telemetry-bridge
+sleep $(( MOCK_INTERVAL_SECONDS * 3 ))
+
+# The backlog, named -- and asserted non-empty for the same reason the
+# bridge-stopped step above asserts it: bridge down with the database up is the
+# one shape where the queue is directly measurable, and a step with nothing to
+# drain proves nothing while still going green.
+required_ids="$(archived_uplink_ids)"
+backlog_ids="$(LC_ALL=C comm -23 <(printf '%s\n' "$required_ids") <(captured_uplink_ids))"
+backlog="$(id_count "$backlog_ids")"
+[ "$backlog" -gt 0 ] \
+  || fail "the broker was handed nothing to hold -- no uplink was archived while the bridge was down, so this step would prove nothing"
+echo "[farm-e2e] the broker is holding ${backlog} uplink(s) with nothing consuming them"
+
+# `stop`, not `kill`: compose sends SIGTERM, and mosquitto's exit path is one of
+# exactly three things that writes its session database to disk. That is the
+# distinction the next step takes apart.
+docker compose stop mosquitto
+docker compose start mosquitto
+wait_for_broker "after restarting the broker with a backlog queued"
+
+docker compose start telemetry-bridge
+wait_for_capture_of "backlog drained after the broker restarted (${backlog} uplink(s) queued through it)" \
+  "$required_ids" 180
+echo "[farm-e2e] the broker kept the backlog across its own restart"
+
+step "resilience: the broker is killed outright"
+
+# SIGKILL, so no shutdown path runs and nothing is flushed on the way out. What
+# survives is whatever the last checkpoint caught, which is why this step waits
+# for one before killing rather than killing immediately: mosquitto's persistence
+# is a periodic checkpoint, not a journal.
+#
+# Without autosave_interval set, mosquitto's default is 1800s and this step could
+# not be written at all -- the whole backlog would be inside the window and the
+# assertion would be "some of it, probably". broker_autosave_seconds refuses if
+# the setting is gone, so removing it fails this step rather than quietly
+# widening what it tolerates.
+autosave_seconds="$(broker_autosave_seconds)"
+
+docker compose stop telemetry-bridge
+sleep $(( MOCK_INTERVAL_SECONDS * 3 ))
+
+required_ids="$(archived_uplink_ids)"
+backlog_ids="$(LC_ALL=C comm -23 <(printf '%s\n' "$required_ids") <(captured_uplink_ids))"
+backlog="$(id_count "$backlog_ids")"
+[ "$backlog" -gt 0 ] \
+  || fail "the broker was handed nothing to hold -- no uplink was archived while the bridge was down, so this step would prove nothing"
+echo "[farm-e2e] the broker is holding ${backlog} uplink(s); waiting ${autosave_seconds}s for it to checkpoint them"
+
+# The scope of the guarantee, made executable. Every id in the set above has now
+# been queued for longer than one checkpoint interval, so a checkpoint has
+# certainly covered it. Uplinks queued *during* this wait are not in the set and
+# are deliberately not claimed -- they are the residual window, and the honest
+# statement of it is that an unclean death costs up to autosave_interval seconds
+# of queue and no more.
+sleep $(( autosave_seconds + 10 ))
+
+docker compose kill -s KILL mosquitto
+# `restart: unless-stopped` may well have brought it back before this line runs,
+# which is the point rather than a problem -- `start` on a running container is a
+# no-op, and wait_for_broker is what actually gates the rest of the step.
+docker compose start mosquitto
+wait_for_broker "after the broker was killed outright"
+
+docker compose start telemetry-bridge
+wait_for_capture_of "backlog survived an unclean broker death (${backlog} uplink(s) checkpointed before the kill)" \
+  "$required_ids" 180
+echo "[farm-e2e] a checkpointed backlog survived the broker being killed outright"
+
+# And the publisher side came back too, which none of the assertions above can
+# show. Everything they compare was archived *before* the broker died, so a
+# ChirpStack or gateway bridge that never reconnected to the new broker would
+# leave both stores frozen at the same contents and every check would still pass
+# -- including the settled one at the end, which compares the two stores to each
+# other rather than to a moving fleet.
+#
+# So this waits for the archive to *grow*: a fresh uplink getting all the way
+# from a mock sensor through the gateway bridge, the restarted broker, and
+# ChirpStack into the archive. Generous, because it needs a whole uplink round
+# and every hop's own reconnect backoff.
+archived_before_recovery="$(id_count "$required_ids")"
+growth_deadline=$(( $(date +%s) + MOCK_INTERVAL_SECONDS * 4 + 60 ))
+while :; do
+  archived_now="$(id_count "$(archived_uplink_ids)")"
+  if [ "$archived_now" -gt "$archived_before_recovery" ]; then
+    echo "[farm-e2e] the whole publish path recovered — the archive grew ${archived_before_recovery} → ${archived_now}"
+    break
+  fi
+  [ "$(date +%s)" -lt "$growth_deadline" ] \
+    || fail "no uplink reached the archive after the broker was killed (still ${archived_now}) -- the gateway bridge or ChirpStack never reconnected to it"
+  sleep 3
+done
+
 step "stopping the mock fleet"
 docker compose --profile mock stop mock-sensors
 sleep 5
 
-# ── nothing was lost across the three failures ────────────────────────────────
+# ── nothing was lost across the six failures ──────────────────────────────────
 
-step "asserting nothing was lost across the three failures"
+step "asserting nothing was lost across the six failures"
 
 # The captured-vs-archived comparison up top ran before any failure was injected.
-# This is that same assertion after all three of them, and it is the one that
+# This is that same assertion after all six of them, and it is the one that
 # holds regardless of which step a loss would be attributable to: whatever
 # ChirpStack received across the whole run, the bridge has.
 #
@@ -615,7 +827,9 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   || fail "the event archive's GraphQL endpoint stopped answering"
 echo "[farm-e2e] the event archive still holds ${archived_after} uplink(s) and answers GraphQL"
 
-# events-postgres is never touched by any of the three failures, so the check
+# events-postgres is never touched by any of the six failures -- the broker steps
+# starve it of uplinks while mosquitto is down, since ChirpStack is fed over the
+# same broker, but nothing stops it and nothing takes rows away. So the check
 # above proves the two stores stay independent rather than that this one
 # recovered. The farm store's API is the one that had its database pulled out
 # from under it, so the run exits with both read surfaces proven rather than

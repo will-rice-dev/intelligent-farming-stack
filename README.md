@@ -296,14 +296,46 @@ where to look: `docker compose logs farmdata-migrate`.
 `scripts/farm-e2e.sh` boots the farm profile with the mock fleet and walks the whole path: uplinks
 land as normalized, property-stamped readings, every metric resolves in the dictionary, the store
 answers GraphQL, a device is curated through the curation API, and the curation-lag alarm is
-asserted by its exit code. It then puts the path under the three failures it has to survive — the
-database stopped underneath it, the bridge stopped while the broker keeps receiving, and the bridge
-killed outright — and checks that ingestion resumes each time with nothing left behind. Each
+asserted by its exit code. It then puts the path under the six failures it has to survive — the
+database stopped underneath it, the bridge stopped while the broker keeps receiving, the bridge
+killed outright, and then the broker itself restarted under a live bridge, restarted with a backlog
+queued, and killed outright — and checks that ingestion resumes each time with nothing left behind.
+Each
 recovery is asserted per message rather than by count: the uplink ids
 ChirpStack's archive held at the moment the failure ended all have to reach `farmdata`, and since
 the mock fleet publishes throughout, only a set can carry that — a count bar taken at the same
 moment is met by the next few uplink rounds with the whole backlog discarded. A red step names the
 uplinks that went missing.
+
+**The broker steps are the load-bearing half**, because the bridge holds nothing in its own process:
+it acknowledges a message only after committing the reading, and leans on the broker's
+persistent-session queue as the buffer. So mosquitto's durability *is* the "an outage costs latency,
+not data" guarantee rather than a detail of it — and that guarantee has a scope worth stating.
+`persistence true` is a periodic **checkpoint**, not a journal: mosquitto writes its session database
+on a clean exit, on `SIGUSR1`, and every `autosave_interval` seconds, and nowhere else. A broker that
+shuts down cleanly hands the queue back intact. A broker killed outright hands back only what its
+last checkpoint caught, and mosquitto's default interval is 1800 seconds — so `mosquitto.conf` sets
+**30s**, and the killed-broker step waits one interval, read from that file, before pulling the
+plug. Everything queued longer than that is asserted to survive; the last 30 seconds is the
+documented cost, and the step says so rather than claiming otherwise.
+
+What an unclean death costs is the whole session, not just its queue: the reconnect comes back with
+session-present clear, meaning the broker has forgotten the *subscription* as well. A subscriber that
+subscribed once at startup would then sit connected to a broker that never speaks to it again — a
+farm going quiet rather than a farm losing a few readings, and silent on both sides. The bridge
+re-subscribes on every connect, and the first broker step asserts that end to end by bouncing the
+broker under a live bridge and watching ingestion continue.
+
+The last broker step also asserts that the **publish** path recovered, not just the consumer. Every
+other comparison is against uplinks the archive held *before* the broker died, so a ChirpStack or
+gateway bridge that never reconnected would leave both stores frozen at identical contents and pass
+every check — including the settled one at the end, which compares the two stores to each other. So
+it waits for the archive to grow again: a fresh uplink getting all the way from a mock sensor through
+the gateway bridge, the restarted broker, and ChirpStack into `event_up`.
+
+Nothing published *through* a stopped broker reaches either store — the gateway bridges reach
+ChirpStack over mosquitto too — so both stores go quiet together while it is down, which is what
+keeps the per-message comparison honest across a broker outage.
 
 The database-outage step re-asserts `farmdata-api` itself as well, not only the store behind it.
 Every other check after a failure reads `farmdata` through `psql`, so a read API left dead by a
@@ -318,17 +350,24 @@ bash scripts/farm-e2e.sh              # tears the stack down afterwards
 FARM_E2E_KEEP=1 bash scripts/farm-e2e.sh   # leave it running (fast iteration)
 ```
 
-It takes a few minutes, most of it waiting on uplink rounds. Counts are asserted as floors, never as
-exact fleet totals: `mock-sensors` sends one unacknowledged UDP datagram per uplink with no
-retransmit, so an occasional frame never reaches ChirpStack at all, and that is a transport flake
-rather than a bridge regression. What proves nothing was lost is the comparison against ChirpStack's
-own archive, which is flake-immune for the same reason — a datagram that never arrived is in neither
-store, so it is on neither side of it.
+It takes upwards of ten minutes, most of it waiting on uplink rounds, on containers stopping and
+starting, and on the one checkpoint interval the killed-broker step sits through. Counts are asserted
+as floors, never as exact fleet totals: `mock-sensors` sends one unacknowledged UDP datagram per
+uplink with no retransmit, so an occasional frame never reaches ChirpStack at all, and that is a
+transport flake rather than a bridge regression. What proves nothing was lost is the comparison
+against ChirpStack's own archive, which is flake-immune for the same reason — a datagram that never
+arrived is in neither store, so it is on neither side of it.
 
-The deterministic versions of those three failures — including a daemon killed in the exact window
-between its commit and the message's acknowledgment — live in the telemetry-bridge repo's own
-`npm run db:exercise:resilience`, which can drive the consumer in-process. This script proves the
+The deterministic versions of those failures — including a daemon killed in the exact window between
+its commit and the message's acknowledgment, and a broker whose persisted session is deleted
+outright — live in the telemetry-bridge repo's own `npm run db:exercise:resilience`, which can drive
+the consumer in-process and read the CONNACK's session-present flag directly. This script proves the
 same recoveries for the packaged daemon on the real ChirpStack path.
+
+The deliberate total loss stays over there for a reason: an uplink destroyed on this bench is missing
+from `farmdata` for good, so it would fail the end-of-run "nothing was lost" comparison on this run
+and every later run against a kept bench. The bridge's fixtures are reserved device EUIs it deletes
+at the start of each run, so it can afford to destroy a session and assert what that costs.
 
 That in-process form is also the only place a redelivery can be **observed**. Every trace of one is
 collapsed by a primary key — `reading`, `reading_latest`, `ingest_event` and `device_event` all
