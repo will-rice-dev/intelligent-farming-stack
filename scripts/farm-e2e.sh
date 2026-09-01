@@ -6,9 +6,9 @@
 # ChirpStack and mosquitto into the telemetry bridge, landing as normalized,
 # property-stamped readings in farmdata, queryable over GraphQL, with a device
 # curated through the curation API and the curation-lag alarm asserted by its
-# exit code. Then the same path put under six failures it has to survive --
+# exit code. Then the same path put under seven failures it has to survive --
 # three in the consumer and its database, three in the broker holding the queue
-# that the first three depend on.
+# that the first three depend on, and one that breaks everything at once.
 #
 # The sibling scripts/e2e.sh proves the *event archive* path (mock-sensors ->
 # ChirpStack -> the PostgreSQL integration -> events-api). This one proves the
@@ -276,6 +276,25 @@ wait_for_broker() {
 # mosquitto's 1800s default and nothing queued in the last half hour is on disk.
 # A step carrying its own copy of the number would keep passing after someone
 # changed the real one.
+# The container id compose currently holds for a service, or empty. `ps -aq`
+# rather than `ps -q` so a one-shot that has already exited is still found --
+# which is the whole point here, since the one-shots are exactly what needs
+# inspecting after a restart.
+service_container() {
+  docker compose --profile farm --profile mock ps -aq "$1" 2>/dev/null | head -1
+}
+
+# When a container last started, plus how it ended. Read as one string so a
+# one-shot can be shown to have genuinely re-executed rather than been skipped:
+# compose reports success either way, and the exit code alone is unchanged by a
+# run that never happened.
+oneshot_state() {
+  local cid
+  cid="$(service_container "$1")"
+  [ -n "$cid" ] || fail "service $1 has no container at all -- it never ran"
+  docker inspect "$cid" --format '{{.State.StartedAt}} {{.State.Status}} {{.State.ExitCode}}'
+}
+
 broker_autosave_seconds() {
   local seconds
   seconds="$(awk '/^autosave_interval[[:space:]]+[0-9]+[[:space:]]*$/ { print $2 }' mosquitto/mosquitto.conf)"
@@ -834,16 +853,189 @@ while :; do
   sleep 3
 done
 
+# ── failure 7: the whole box power-cycles ─────────────────────────────────────
+#
+# The six above each break one thing. A power blip at 3am breaks all of them at
+# once, and "each recovery works" is a different claim from "they compose".
+# Four things only a simultaneous restart reaches:
+#
+#   - `docker compose restart` keeps dependency *ordering* and drops every
+#     depends_on *condition* -- those gate `up`, not `restart`. So the bridge
+#     loses its `mosquitto: service_healthy` gate and farmdata-api loses both
+#     of its, which is exactly what a Docker daemon coming back after a power
+#     cut does to them.
+#   - farmdata-api races farm-postgres. PostGraphile introspects at boot with
+#     watchPg off, so losing that race is not a slow start, it is a server
+#     answering errors until something restarts it.
+#   - the three one-shots re-run. `restart: "no"` is a policy, not a shield
+#     against an explicit restart, and their idempotency is asserted in prose
+#     and nowhere else. A provisioner that re-minted the tenant API key instead
+#     of reusing it would strand the bridge's reconciler on a stale credential
+#     with nothing failing loudly.
+#   - the whole publish chain re-forms at once: redis, chirpstack-postgres,
+#     ChirpStack, the gateway bridge and the broker, in no particular order.
+#
+# The fleet is stopped and allowed to settle first, and that is load-bearing
+# rather than cautious. ChirpStack dispatches its integrations concurrently
+# (futures::future::join_all), so the MQTT publish and the PostgreSQL archive
+# write race each other for any uplink it is handling -- and mosquitto is going
+# down in the same window. An uplink can therefore land in event_up with its
+# publish refused and never retried, which is an id the archive holds forever
+# and farmdata never receives: the end-of-run comparison then goes permanently
+# red on a bench nobody can un-poison. Nothing downstream can fix that, because
+# the two integrations are not transactional with each other -- so it is a scope
+# limit on the guarantee (it starts at the broker, not at ChirpStack) rather
+# than a thing to assert. Same precondition, same reason, as the killed-broker
+# step above.
+#
+# What makes the bar mean anything is the backlog: with the fleet quiet and the
+# bridge caught up, every id is already in farmdata and wait_for_capture_of
+# would pass instantly having proved nothing. So the bridge is stopped for a few
+# uplink rounds first, the way failures 2, 5 and 6 do it, and the frozen set is
+# genuinely at risk.
+
+step "FAILURE 7 -- the whole box power-cycles, everything at once"
+
+# Read out-of-band: nothing needs to be running for this, which matters because
+# the bridge is about to be stopped. `--entrypoint cat` bypasses
+# farm/bridge-entrypoint.sh, and `run` inherits the service's shared:ro mount.
+key_before="$(docker compose run --rm --no-deps -T --entrypoint cat telemetry-bridge /shared/config.json | json_field '.apiKey')"
+[ -n "$key_before" ] || fail "could not read the tenant API key out of /shared/config.json"
+
+provisioner_before="$(oneshot_state provisioner)"
+schema_wait_before="$(oneshot_state events-schema-wait)"
+migrate_before="$(oneshot_state farmdata-migrate)"
+echo "[farm-e2e] one-shots before the cycle: provisioner [${provisioner_before}], events-schema-wait [${schema_wait_before}], farmdata-migrate [${migrate_before}]"
+
+# Give the broker something to hold across the cycle.
+docker compose stop telemetry-bridge
+sleep $(( MOCK_INTERVAL_SECONDS * 3 ))
+
+# Then quiesce the publisher, for the join_all reason above.
+docker compose --profile mock stop mock-sensors
+sleep 5
+
+log_mark="$(docker compose logs --no-color telemetry-bridge | wc -l | tr -d ' ')"
+
+required_ids="$(archived_uplink_ids)"
+backlog_ids="$(LC_ALL=C comm -23 <(printf '%s\n' "$required_ids") <(captured_uplink_ids))"
+backlog="$(id_count "$backlog_ids")"
+[ "$backlog" -gt 0 ] \
+  || fail "nothing was queued behind the bridge, so a power cycle here would prove nothing -- the frozen set is already in farmdata"
+echo "[farm-e2e] ${backlog} uplink(s) queued behind the stopped bridge; power-cycling the box under them"
+
+# The one line this step is about. An explicit list rather than a bare
+# `restart`: leftenant and the basicstation bridge are never booted by this
+# script, and a bare restart's behavior over a service with no container is not
+# a thing to depend on. The one-shots are named deliberately -- their re-run is
+# one of the four claims.
+#
+# `restart`, not `down`/`up`. It is the only one of the two that drops the
+# depends_on conditions, which is the point; it is what a daemon restart after a
+# power cut looks like; and it keeps the container logs, so the log_mark
+# arithmetic below still works -- `down` discards them with the container.
+CYCLE_SERVICES="$SERVICES provisioner events-schema-wait farmdata-migrate mock-sensors"
+# shellcheck disable=SC2086
+docker compose --profile farm --profile mock restart -t 30 $CYCLE_SERVICES
+
+wait_for_broker "after the whole box power-cycled"
+
+# The bridge noticed and came back. Polled rather than read once after a sleep,
+# like the clean-broker-restart step: the bridge reconnects on its own timer and
+# is starting cold against peers that are themselves still coming up. Read into
+# a variable and matched with a here-string -- never `logs | grep -q`, which
+# takes compose's EPIPE and fails the step on the match it found.
+reconnect_deadline=$(( $(date +%s) + 180 ))
+while :; do
+  bridge_log="$(docker compose logs --no-color telemetry-bridge | tail -n "+$((log_mark + 1))")"
+  if grep -qE 'broker unreachable|reconnecting to the broker|connected to .* as "|writer session: connect attempt|writer session: connection error' <<<"$bridge_log"; then
+    break
+  fi
+  [ "$(date +%s)" -lt "$reconnect_deadline" ] \
+    || fail "the bridge logged nothing about connecting after the power cycle -- it never came back"
+  sleep 2
+done
+echo "[farm-e2e] the bridge came back and reported it"
+
+wait_for_capture_of "backlog survived a whole-box power cycle (${backlog} uplink(s) queued through it)" \
+  "$required_ids" 240
+
+# The publish chain re-formed, which nothing above can show: everything compared
+# so far was archived before the cycle, so a ChirpStack or gateway bridge that
+# never reconnected would leave both stores frozen at identical contents and
+# every check would still pass. Same growth poll, same reasoning, as the
+# killed-broker step -- and here it additionally covers redis and
+# chirpstack-postgres, which no other failure in this script touches.
+archived_before_recovery="$(id_count "$required_ids")"
+growth_deadline=$(( $(date +%s) + MOCK_INTERVAL_SECONDS * 6 + 120 ))
+while :; do
+  archived_now="$(id_count "$(archived_uplink_ids)")"
+  if [ "$archived_now" -gt "$archived_before_recovery" ]; then
+    echo "[farm-e2e] the whole publish path recovered — the archive grew ${archived_before_recovery} → ${archived_now}"
+    break
+  fi
+  [ "$(date +%s)" -lt "$growth_deadline" ] \
+    || fail "no uplink reached the archive after the power cycle (still ${archived_now}) -- redis, chirpstack-postgres, ChirpStack or the gateway bridge never came back"
+  sleep 3
+done
+
+# farmdata-api won its race with farm-postgres, or was restarted until it did.
+wait_for_farm_graphql "after the whole box power-cycled" 180
+
+# Each one-shot re-ran, and re-ran cleanly. StartedAt is what says it re-ran at
+# all -- the status and exit code of a container that was skipped are identical
+# to those of one that succeeded, so without this the check would pass over a
+# compose version that quietly left them alone.
+for pair in "provisioner:$provisioner_before" "events-schema-wait:$schema_wait_before" "farmdata-migrate:$migrate_before"; do
+  svc="${pair%%:*}"
+  was="${pair#*:}"
+  now="$(oneshot_state "$svc")"
+  [ "$now" != "$was" ] \
+    || fail "$svc did not re-run across the power cycle (still [${now}]) -- its idempotency is asserted nowhere else, so this step is the only thing exercising it"
+  [ "$(printf '%s' "$now" | awk '{print $2, $3}')" = "exited 0" ] \
+    || fail "$svc re-ran and did not exit 0: [${now}]"
+  echo "[farm-e2e] ${svc} re-ran as a no-op and exited 0"
+done
+
+# And the provisioner reused the tenant API key rather than minting a new one.
+# A re-mint is the failure with no symptom: the token is only returned at
+# creation, so the running bridge would keep the old one and every reconcile
+# sweep would 401 while ingest carried on looking healthy.
+key_after="$(docker compose run --rm --no-deps -T --entrypoint cat telemetry-bridge /shared/config.json | json_field '.apiKey')"
+[ "$key_after" = "$key_before" ] \
+  || fail "the provisioner minted a new tenant API key across the cycle -- the running bridge still holds the old one and its reconciler is on a dead credential"
+echo "[farm-e2e] the provisioner reused the existing tenant API key"
+
+# Operator curation survived the cycle, farmdata-migrate's re-run included.
+# Nothing else here asserts that a re-applied migration chain leaves a person's
+# placement alone, and a seeder that reached into an open assignment would look
+# exactly like a healthy run from every other angle.
+curated_after="$(farm_psql "SELECT count(*) FROM registry.device_assignment WHERE device_id = '${device_id}' AND upper_inf(valid_range) AND assigned_by = 'farm-e2e-operator'")"
+[ "$curated_after" = "1" ] \
+  || fail "the operator's open placement on ${device_id} did not survive the power cycle (found ${curated_after}, wanted 1)"
+still_listed_after="$(curation_get '/v1/devices?needsCuration=true' | json_field ".devices.filter(d=>d.deviceId==='${device_id}').length")"
+[ "$still_listed_after" = "0" ] || fail "the curated device came back onto the worklist after the power cycle"
+echo "[farm-e2e] the curated placement survived, and the device is still off the worklist"
+
+# A power cycle is where redelivery happens, so the key that makes a redelivery
+# a no-op is worth re-asserting here. A schema guard rather than a bridge
+# assertion, exactly as in the bridge-kill step: it returns nothing whether or
+# not anything replayed, and what it catches is a migration widening or dropping
+# telemetry.reading's primary key.
+dupes="$(farm_psql "SELECT count(*) FROM (SELECT device_id, metric, channel, measured_at FROM telemetry.reading GROUP BY 1,2,3,4 HAVING count(*) > 1) d")"
+[ "$dupes" = "0" ] || fail "$dupes reading key(s) appear more than once -- telemetry.reading's primary key is no longer enforcing idempotency"
+echo "[farm-e2e] no reading key appears twice — idempotency survived the cycle"
+
 step "stopping the mock fleet"
 docker compose --profile mock stop mock-sensors
 sleep 5
 
-# ── nothing was lost across the six failures ──────────────────────────────────
+# ── nothing was lost across the seven failures ────────────────────────────────
 
-step "asserting nothing was lost across the six failures"
+step "asserting nothing was lost across the seven failures"
 
 # The captured-vs-archived comparison up top ran before any failure was injected.
-# This is that same assertion after all six of them, and it is the one that
+# This is that same assertion after all seven of them, and it is the one that
 # holds regardless of which step a loss would be attributable to: whatever
 # ChirpStack received across the whole run, the bridge has.
 #
@@ -871,15 +1063,22 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   || fail "the event archive's GraphQL endpoint stopped answering"
 echo "[farm-e2e] the event archive still holds ${archived_after} uplink(s) and answers GraphQL"
 
-# events-postgres is never touched by any of the six failures -- the broker steps
-# starve it of uplinks while mosquitto is down, since ChirpStack is fed over the
-# same broker, but nothing stops it and nothing takes rows away. So the check
-# above proves the two stores stay independent rather than that this one
-# recovered. The farm store's API is the one that had its database pulled out
-# from under it, so the run exits with both read surfaces proven rather than
-# one proven at the start and one at the end. No retry here: it came back
-# during the database-outage step, which is where a failure to recover would
-# be attributable.
+# The first six failures never touch events-postgres -- the broker steps starve
+# it of uplinks while mosquitto is down, since ChirpStack is fed over the same
+# broker, but nothing stops it and nothing takes rows away. So against those six
+# the check above proves the two stores stay independent rather than that this
+# one recovered.
+#
+# Failure 7 restarts it along with everything else, which makes the same two
+# lines say more than they used to: `archived_after -ge archived` is now also
+# the assertion that a power cycle cost the archive nothing, and the curl below
+# that events-api came back at all. Neither needs a retry loop -- the growth
+# poll inside that step already waited for a fresh uplink to reach this
+# database, so by here it has been answering for a while.
+#
+# The farm store's API is the one that had its database pulled out from under it
+# twice, so the run exits with both read surfaces proven rather than one proven
+# at the start and one at the end.
 assert_graphql_ok "farmdata-api once everything settled" \
   "$(graphql 'query { allReadingLatests(first: 1) { nodes { deviceId metric valueNum } } }')"
 

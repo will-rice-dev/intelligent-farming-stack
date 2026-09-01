@@ -296,11 +296,11 @@ where to look: `docker compose logs farmdata-migrate`.
 `scripts/farm-e2e.sh` boots the farm profile with the mock fleet and walks the whole path: uplinks
 land as normalized, property-stamped readings, every metric resolves in the dictionary, the store
 answers GraphQL, a device is curated through the curation API, and the curation-lag alarm is
-asserted by its exit code. It then puts the path under the six failures it has to survive — the
+asserted by its exit code. It then puts the path under the seven failures it has to survive — the
 database stopped underneath it, the bridge stopped while the broker keeps receiving, the bridge
-killed outright, and then the broker itself restarted under a live bridge, restarted with a backlog
-queued, and killed outright — and checks that ingestion resumes each time with nothing left behind.
-Each
+killed outright, then the broker itself restarted under a live bridge, restarted with a backlog
+queued, and killed outright, and finally the whole box power-cycled at once — and checks that
+ingestion resumes each time with nothing left behind. Each
 recovery is asserted per message rather than by count: the uplink ids
 ChirpStack's archive held at the moment the failure ended all have to reach `farmdata`, and since
 the mock fleet publishes throughout, only a set can carry that — a count bar taken at the same
@@ -345,6 +345,43 @@ Nothing published *through* a stopped broker reaches either store — the gatewa
 ChirpStack over mosquitto too — so both stores go quiet together while it is down, which is what
 keeps the per-message comparison honest across a broker outage.
 
+**The seventh failure is the one an operator actually asks about.** The other six each break one
+component, and six recoveries composing is a different claim from one whole-box recovery. So the last
+step power-cycles everything in a single `docker compose restart` — which is not the same as a
+`down`/`up`, and the difference is the point: `depends_on` conditions gate `up`, not `restart`, so
+the bridge loses its `mosquitto: service_healthy` gate and `farmdata-api` loses both of its. That is
+exactly what a Docker daemon coming back after a power cut does to them, and nothing else here
+reaches it. Nor is it theoretical: on a verified run compose brought `mock-sensors` up *first* —
+before the ChirpStack and gateway bridge it publishes through existed — started `telemetry-bridge`
+and `farmdata-api` *before* `farm-postgres`, and left `farm-postgres` and `redis` for last. Every
+one of those orderings is forbidden on `up`. Four things only this step exercises: the bridge starting cold against a half-up broker
+and database; `farmdata-api` racing `farm-postgres`; the three one-shots (`provisioner`,
+`events-schema-wait`, `farmdata-migrate`) re-running, whose idempotency was asserted in prose and
+nowhere else; and redis, `chirpstack-postgres`, ChirpStack and the gateway bridge all re-forming the
+publish chain in no particular order.
+
+It carries three assertions no other step can make. Each one-shot re-ran **and** exited 0 — checked
+by `StartedAt`, because a container that was skipped has the same status and exit code as one that
+succeeded, so the exit code alone would pass over a compose version that quietly left them alone.
+The provisioner **reused** the tenant API key rather than minting a new one: the token is only
+returned at creation, so a re-mint would leave the running bridge holding the old one and every
+reconcile sweep 401ing while ingest carried on looking healthy. And the operator's curated placement
+survived, which is the only thing checking that `farmdata-migrate` re-applying over a warm database
+leaves a person's decision alone.
+
+**This step quiesces the fleet first, and that is a scope limit rather than caution.** ChirpStack
+dispatches its integrations concurrently — `futures::future::join_all`, not the order
+`enabled=["mqtt","postgresql"]` is written in — so for any uplink it is handling, the MQTT publish
+and the `event_up` write race each other, and a publish refused by a broker going down in the same
+window is logged rather than retried. An uplink can therefore land in the archive with its publish
+never having happened: an id `farmdata` will never receive, which reddens the end-of-run comparison
+on this run and every later one against a kept bench. Nothing downstream can fix it, because the two
+integrations are not transactional with each other. **So the ingest guarantee begins at the broker,
+not at ChirpStack** — the same shape of scoping as the checkpoint window above, and the reason the
+fleet is stopped and allowed to settle before the plug is pulled. What makes the frozen set mean
+anything with the fleet quiet is the backlog: the bridge is stopped for a few uplink rounds first, so
+the ids being waited for are genuinely still in the broker rather than already in `farmdata`.
+
 The database-outage step re-asserts `farmdata-api` itself as well, not only the store behind it.
 Every other check after a failure reads `farmdata` through `psql`, so a read API left dead by a
 database blip would pass the rest of the run — and unlike the bridge, it has no retry loop of its
@@ -358,8 +395,8 @@ bash scripts/farm-e2e.sh              # tears the stack down afterwards
 FARM_E2E_KEEP=1 bash scripts/farm-e2e.sh   # leave it running (fast iteration)
 ```
 
-It takes upwards of ten minutes, most of it waiting on uplink rounds, on containers stopping and
-starting, and on the one checkpoint interval the killed-broker step sits through. Counts are asserted
+It takes upwards of a quarter of an hour, most of it waiting on uplink rounds, on containers
+stopping and starting, and on the one checkpoint interval the killed-broker step sits through. Counts are asserted
 as floors, never as exact fleet totals: `mock-sensors` sends one unacknowledged UDP datagram per
 uplink with no retransmit, so an occasional frame never reaches ChirpStack at all, and that is a
 transport flake rather than a bridge regression. What proves nothing was lost is the comparison
@@ -370,7 +407,11 @@ The deterministic versions of those failures — including a daemon killed in th
 its commit and the message's acknowledgment, and a broker whose persisted session is deleted
 outright — live in the telemetry-bridge repo's own `npm run db:exercise:resilience`, which can drive
 the consumer in-process and read the CONNACK's session-present flag directly. This script proves the
-same recoveries for the packaged daemon on the real ChirpStack path.
+same recoveries for the packaged daemon on the real ChirpStack path. The power cycle has a
+counterpart there too, and the split is the same: that exercise restarts the broker and the database
+in one call under a live consumer, so it can assert on the consumer's own counters that both
+reconnect loops recovered and neither wedged the other, while what only this script can show is the
+other ten services coming back with it.
 
 The deliberate total loss stays over there for a reason: an uplink destroyed on this bench is missing
 from `farmdata` for good, so it would fail the end-of-run "nothing was lost" comparison on this run
