@@ -315,9 +315,17 @@ not data" guarantee rather than a detail of it — and that guarantee has a scop
 on a clean exit, on `SIGUSR1`, and every `autosave_interval` seconds, and nowhere else. A broker that
 shuts down cleanly hands the queue back intact. A broker killed outright hands back only what its
 last checkpoint caught, and mosquitto's default interval is 1800 seconds — so `mosquitto.conf` sets
-**30s**, and the killed-broker step waits one interval, read from that file, before pulling the
-plug. Everything queued longer than that is asserted to survive; the last 30 seconds is the
-documented cost, and the step says so rather than claiming otherwise.
+**30s**, and the killed-broker step stops the mock fleet and then waits one interval, read from that
+file, before pulling the plug — so the whole archive has been checkpointed when the kill lands and
+every uplink in it is asserted to survive.
+
+Stopping the fleet is what makes that sound rather than lucky. The step's own assertion covers only
+the set it froze, but the end-of-run check covers the **whole** archive, and an uplink archived after
+the last checkpoint tick dies unsaved in the SIGKILL. Left publishing, the step would be staking the
+run's strongest assertion on where the autosave clock happened to be — and a bench that genuinely
+loses an uplink stays red on every later run until its volumes are destroyed. So the residual window
+is real and is stated rather than tested: an unclean death costs up to `autosave_interval` seconds of
+queue. That is the guarantee's scope, and the bench stays outside it by construction.
 
 What an unclean death costs is the whole session, not just its queue: the reconnect comes back with
 session-present clear, meaning the broker has forgotten the *subscription* as well. A subscriber that

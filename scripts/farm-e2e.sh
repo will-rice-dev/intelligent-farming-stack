@@ -596,10 +596,15 @@ echo "[farm-e2e] the broker held the backlog and the bridge drained it"
 step "resilience: the bridge is killed outright"
 
 # SIGKILL, so no shutdown path runs at all: whatever was mid-write is
-# abandoned without acknowledgment and the broker still holds it. The service
-# carries `restart: unless-stopped`, so Docker may well bring it back on its
-# own before the `start` below -- which is the point rather than a problem, and
-# `start` on an already-running container is a no-op either way.
+# abandoned without acknowledgment and the broker still holds it.
+#
+# The `start` below is what brings it back, not the restart policy. Verified,
+# because the comment here used to say the opposite: `restart: unless-stopped`
+# covers a process that dies on its own -- a crash, an OOM kill -- but Docker
+# records a kill through its API as a manual stop, so an API-killed container
+# stays exited with RestartCount 0 however long you wait. The policy is what
+# recovers farmdata-api during the database outage above, which exits itself;
+# it is not what recovers anything a `compose kill` here takes down.
 docker compose kill -s KILL telemetry-bridge
 sleep "$MOCK_INTERVAL_SECONDS"
 # Taken after the sleep but before the `start`, so it covers what was abandoned
@@ -739,6 +744,22 @@ autosave_seconds="$(broker_autosave_seconds)"
 docker compose stop telemetry-bridge
 sleep $(( MOCK_INTERVAL_SECONDS * 3 ))
 
+# The publisher stops before the checkpoint wait, and that is load-bearing
+# rather than tidiness. This step's own assertion only claims the set frozen
+# below, so uplinks arriving during the wait would be outside it -- but the
+# settled check at the end of the run claims the *whole* archive, and an uplink
+# archived after the last checkpoint tick dies unsaved in the SIGKILL. Left
+# publishing, this step would silently stake the run's strongest assertion on
+# where the autosave clock happened to be when the kill landed: a burst inside
+# the gap turns the bench red, and stays red on every later run until `down -v`,
+# because a lost uplink is lost for good. Whether that happens depends on the
+# tick phase, which the previous step's broker restart re-phases -- so it is
+# incidental timing, not something the step controls. With the fleet stopped,
+# nothing can enter the residual window and both assertions are sound. It comes
+# back once the broker does, since the recovery check below needs traffic.
+docker compose --profile mock stop mock-sensors
+sleep 5
+
 required_ids="$(archived_uplink_ids)"
 backlog_ids="$(LC_ALL=C comm -23 <(printf '%s\n' "$required_ids") <(captured_uplink_ids))"
 backlog="$(id_count "$backlog_ids")"
@@ -746,20 +767,40 @@ backlog="$(id_count "$backlog_ids")"
   || fail "the broker was handed nothing to hold -- no uplink was archived while the bridge was down, so this step would prove nothing"
 echo "[farm-e2e] the broker is holding ${backlog} uplink(s); waiting ${autosave_seconds}s for it to checkpoint them"
 
-# The scope of the guarantee, made executable. Every id in the set above has now
-# been queued for longer than one checkpoint interval, so a checkpoint has
-# certainly covered it. Uplinks queued *during* this wait are not in the set and
-# are deliberately not claimed -- they are the residual window, and the honest
-# statement of it is that an unclean death costs up to autosave_interval seconds
-# of queue and no more.
+# The scope of the guarantee, made executable. With the publisher stopped, the
+# archive is now fixed, and after one full interval a checkpoint has certainly
+# covered every id in it -- so the kill below is a kill of a broker that had time
+# to checkpoint, which is exactly the case the guarantee is scoped to. The
+# residual window it does *not* cover -- an uplink queued after the last tick --
+# is real and is what the wait exists to stay out of; it is stated in
+# mosquitto.conf and in the README rather than asserted here, because a bench
+# cannot destroy an uplink without failing its own end-of-run comparison for good.
 sleep $(( autosave_seconds + 10 ))
 
+# The precondition everything above rests on, asserted rather than assumed:
+# nothing entered the residual window while we waited. A count is the right
+# shape here -- the archive only ever grows, so an unchanged count *is* an
+# unchanged set -- and this is a guard on the fixture, not one of the
+# per-message recovery bars the header rules out reducing to counts.
+#
+# What it catches is a future edit that leaves the fleet publishing, or restarts
+# it too early: the failure would otherwise surface as the end-of-run comparison
+# going permanently red on a bench nobody can un-poison, several steps away from
+# the cause. Here it names the cause.
+archived_at_kill="$(id_count "$(archived_uplink_ids)")"
+[ "$archived_at_kill" = "$(id_count "$required_ids")" ] \
+  || fail "the archive grew from $(id_count "$required_ids") to ${archived_at_kill} during the checkpoint wait -- those uplinks are inside the residual window and the kill below would destroy them for good"
+
 docker compose kill -s KILL mosquitto
-# `restart: unless-stopped` may well have brought it back before this line runs,
-# which is the point rather than a problem -- `start` on a running container is a
-# no-op, and wait_for_broker is what actually gates the rest of the step.
+# And `start` is what brings it back -- the restart policy does not, for the
+# reason spelled out in the bridge-kill step above. wait_for_broker is still the
+# gate on the rest of the step, since a started container is not a ready broker.
 docker compose start mosquitto
 wait_for_broker "after the broker was killed outright"
+
+# The publisher comes back before the consumer does, so there is fresh traffic
+# for the publish-path check below and a little more queued behind the bridge.
+docker compose --profile mock up -d mock-sensors
 
 docker compose start telemetry-bridge
 wait_for_capture_of "backlog survived an unclean broker death (${backlog} uplink(s) checkpointed before the kill)" \
@@ -775,10 +816,13 @@ echo "[farm-e2e] a checkpointed backlog survived the broker being killed outrigh
 #
 # So this waits for the archive to *grow*: a fresh uplink getting all the way
 # from a mock sensor through the gateway bridge, the restarted broker, and
-# ChirpStack into the archive. Generous, because it needs a whole uplink round
-# and every hop's own reconnect backoff.
+# ChirpStack into the archive. Generous, because it needs a cold fleet container
+# to boot and re-provision, a whole uplink round, and every hop's own reconnect
+# backoff. The bar is exact rather than a floor guess: the fleet was stopped when
+# the set was frozen, so the archive was fixed at that count and any growth at
+# all is a new uplink.
 archived_before_recovery="$(id_count "$required_ids")"
-growth_deadline=$(( $(date +%s) + MOCK_INTERVAL_SECONDS * 4 + 60 ))
+growth_deadline=$(( $(date +%s) + MOCK_INTERVAL_SECONDS * 6 + 60 ))
 while :; do
   archived_now="$(id_count "$(archived_uplink_ids)")"
   if [ "$archived_now" -gt "$archived_before_recovery" ]; then
