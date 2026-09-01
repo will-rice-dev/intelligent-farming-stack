@@ -28,6 +28,21 @@ export interface MockSensor {
   device: string;
   category: string;
   index: number;
+  /**
+   * Set when this device's profile should carry a codec that *fails* rather
+   * than the real one for its vendor/device.
+   *
+   * The bytes on the wire stay real -- the vendor and device above still name
+   * a curated codec, so `dataVectors` still replays its own decode-verified
+   * test vectors -- and only the script installed in ChirpStack is swapped.
+   * That is the point: a device whose payload is perfectly good and whose
+   * decoder throws is what a fleet actually meets, and it is the only way to
+   * see what ChirpStack does with one. It still publishes the uplink, with no
+   * `object`, so the raw capture lands downstream with zero readings. The
+   * telemetry bridge's "ingestion is never gated on decode" is that fact, and
+   * before this device nothing on the bench exercised it.
+   */
+  brokenCodec?: true;
   /** ABP session credentials (hex strings, no separators). */
   devEui: string;
   devAddr: string;
@@ -108,13 +123,42 @@ const CATALOG: Omit<MockSensor, 'devEui' | 'devAddr' | 'nwkSKey' | 'appSKey'>[] 
   { id: 'makerfabs-none-position-rope-water-leak', vendor: 'makerfabs', device: 'none-position-rope-water-leak', category: 'water-leak', index: 21 },
   { id: 'makerfabs-gps-tracker-neo-6m', vendor: 'makerfabs', device: 'gps-tracker-neo-6m', category: 'gps-tracker', index: 22 },
   { id: 'makerfabs-gps-tracker-pa1010d', vendor: 'makerfabs', device: 'gps-tracker-pa1010d', category: 'gps-tracker', index: 23 },
+
+  // ---- Decode failure ----------------------------------------------------------
+  // A real device sending real bytes behind a codec that throws. It reuses
+  // dragino/lse01's vectors deliberately: the uplink has to be one that *would*
+  // decode, or this proves a bad payload rather than a bad decoder.
+  //
+  // Its category is what it would have been; nothing downstream can learn it,
+  // because category comes from the decoded make/model and there is no decode.
+  // That is the shape an operator has to curate by hand, so having one on the
+  // bench is worth more than the tidy row it costs.
+  { id: 'broken-codec', vendor: 'dragino', device: 'lse01', category: 'soil-monitor', index: 24, brokenCodec: true },
 ];
 
 export const SENSORS: MockSensor[] = CATALOG.map((c) => ({ ...c, ...creds(c.index) }));
 
+/**
+ * A decoder that throws on every uplink, for {@link MockSensor.brokenCodec}.
+ *
+ * It throws rather than returning `{}` or an `errors` array, because those are
+ * codec conventions ChirpStack handles gracefully and this is meant to be the
+ * ugly case: an exception out of the JS runtime, which is what a real codec
+ * with a bug does.
+ */
+const THROWING_CODEC = [
+  '// A deliberately broken codec: the bench needs one device whose decode fails.',
+  'function decodeUplink(input) {',
+  '  throw new Error("mock-sensors: this codec fails on purpose");',
+  '}',
+  'function encodeDownlink(input) {',
+  '  throw new Error("mock-sensors: this codec fails on purpose");',
+  '}',
+].join('\n');
+
 /** The `codec.js` text to install in this sensor's ChirpStack device profile. */
 export function sensorCodec(sensor: MockSensor): string {
-  return codecScript(sensor.vendor, sensor.device);
+  return sensor.brokenCodec === true ? THROWING_CODEC : codecScript(sensor.vendor, sensor.device);
 }
 
 // The codec package's own `vectors()` reads and JSON-parses vectors.json on every

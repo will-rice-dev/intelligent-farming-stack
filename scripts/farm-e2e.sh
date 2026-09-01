@@ -10,6 +10,15 @@
 # three in the consumer and its database, three in the broker holding the queue
 # that the first three depend on, and one that breaks everything at once.
 #
+# Then bad data, which is the other half of what a farm sends: a poison message
+# in the middle of an offline backlog (the one that matters -- an unacked poison
+# does not lose a message, it wedges the queue and stops the farm), timestamps a
+# decoder should never emit, a redelivery observed rather than inferred, and a
+# device whose codec throws. Those steps read the daemon's own counter report,
+# which is the only place some of it is visible: a message dropped deliberately
+# leaves no row, and a redelivery that was deduped leaves exactly the rows one
+# that never happened would.
+#
 # The sibling scripts/e2e.sh proves the *event archive* path (mock-sensors ->
 # ChirpStack -> the PostgreSQL integration -> events-api). This one proves the
 # farm store beside it, which is a different subscriber on the same broker.
@@ -350,6 +359,107 @@ wait_for_capture_of() {
   done
 }
 
+# ── the bridge's own counters ─────────────────────────────────────────────────
+#
+# Everything above reads rows. These read the daemon's report, which is the only
+# place some of what this script now asserts is visible at all: a message the
+# bridge dropped *deliberately* leaves no row to find, and a redelivery that was
+# correctly deduped leaves exactly the rows a redelivery that never happened
+# would. Both used to be unobservable from out here.
+
+# The report the daemon logs on demand, as one JSON object.
+#
+# SIGUSR2 rather than waiting out FARM_BRIDGE_REPORT_INTERVAL_SECONDS: the
+# assertions below are deltas across one injection, and a periodic tick landing
+# inside the injection would straddle it. (SIGUSR2 and not SIGUSR1, which Node
+# reserves for the inspector -- the daemon would open a debugger instead.)
+#
+# Read past a log mark, for the reason the database-outage step reads past one:
+# on a reused bench the window is full of earlier reports, and matching the last
+# line in the whole log would happily return one from a previous run. Captured
+# into a variable and matched with a here-string rather than piped into `grep`,
+# for the pipefail/EPIPE reason spelled out at the database-outage step.
+#
+# ONE TRAP, and it is the one to get wrong: **a bridge restart is a new process
+# and every counter starts at zero.** A report taken before a step that stops,
+# kills or power-cycles the bridge is not a baseline for anything after it.
+bridge_report() {
+  local what="$1" timeout="${2:-30}"
+  local mark deadline log line
+  mark="$(docker compose logs --no-color telemetry-bridge | wc -l | tr -d ' ')"
+  docker compose kill -s USR2 telemetry-bridge >/dev/null 2>&1 \
+    || fail "${what}: could not signal the bridge for a counter report"
+  deadline=$(( $(date +%s) + timeout ))
+  while :; do
+    log="$(docker compose logs --no-color telemetry-bridge | tail -n "+$((mark + 1))")"
+    # The daemon's own diagnostics deliberately say "ingest reporter:", never
+    # this prefix, so nothing but a real report can match here.
+    line="$(sed -n 's/.*ingest report: //p' <<<"$log" | tail -1)"
+    if [ -n "$line" ]; then
+      printf '%s' "$line"
+      return 0
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] \
+      || fail "${what}: the bridge logged no ingest report within ${timeout}s of SIGUSR2 -- is FARM_BRIDGE_REPORT_INTERVAL_SECONDS reaching a daemon old enough to have the reporter?"
+    sleep 1
+  done
+}
+
+# One counter out of a report, by accessor path (".jsonParseFailures",
+# ".writer.envelopesReplayed"). Reuses json_field, so the body is JSON.parsed
+# rather than evaluated.
+report_field() {
+  printf '%s' "$1" | json_field "$2"
+}
+
+# assert_counter LABEL BEFORE AFTER ACCESSOR EXPECTED_DELTA
+#
+# Deltas rather than absolutes throughout, even where a fresh process makes the
+# absolute knowable: this script reuses a running bench, so the same counters
+# carry whatever earlier steps in this run already did to them, and an absolute
+# would be a bar that quietly changes meaning the day a step is inserted above.
+assert_counter() {
+  local label="$1" before="$2" after="$3" accessor="$4" want="$5"
+  local was is delta
+  was="$(report_field "$before" "$accessor")"
+  is="$(report_field "$after" "$accessor")"
+  [ -n "$was" ] && [ -n "$is" ] \
+    || fail "${label}: ${accessor} is not in the bridge's report -- was=\"${was}\" is=\"${is}\""
+  delta=$(( is - was ))
+  [ "$delta" = "$want" ] \
+    || fail "${label}: expected ${accessor} to rise by ${want}, it rose by ${delta} (${was} -> ${is})"
+  echo "[farm-e2e] ${label}: ${accessor} +${delta}"
+}
+
+# The device_id the bridge minted for a DevEUI, or empty if it never made one.
+#
+# Through registry.device_identity rather than a column on registry.device:
+# there is no dev_eui column, deliberately -- a device is one row and its
+# identities are another table, so a sensor that is re-keyed keeps its history.
+# The stored form is uppercase hex with no separators, which is why every
+# lookup here upper()s rather than trusting the caller's spelling.
+device_id_of() {
+  farm_psql "SELECT device_id FROM registry.device_identity WHERE scheme = 'dev_eui' AND id_value = upper('$1')"
+}
+
+# Publish one raw message to an application event topic, as ChirpStack would.
+#
+# From inside the broker container, so this needs no MQTT client on the host and
+# reaches mosquitto at the address its own healthcheck uses. `-s` sends stdin as
+# a single message, so a payload carrying quotes and braces survives intact
+# where `-m "$2"` would depend on this script's quoting all the way down.
+#
+# QoS 1, because that is what the bridge's subscription is and what makes the
+# broker hold the message for an offline persistent session -- the whole point
+# of the poison step. And no `-i`: MQTT hands a client id to whoever connected
+# with it most recently, so a publisher borrowing the bridge's would evict the
+# very session these steps are asserting on.
+publish_app_event() {
+  printf '%s' "$2" \
+    | docker compose exec -T mosquitto mosquitto_pub -h 127.0.0.1 -p 1883 -q 1 -t "$1" -s \
+    || fail "could not publish to $1"
+}
+
 # ── teardown ──────────────────────────────────────────────────────────────────
 
 started=0
@@ -387,8 +497,29 @@ else
   echo "[farm-e2e] farm profile already running — reusing it"
 fi
 
+# The bridge has to be new enough to have the ingest reporter, and this is
+# where to find out rather than two-thirds of the way through the run.
+#
+# It is not a cosmetic version check. Node's default disposition for SIGUSR2 is
+# to *terminate*, so a daemon built before the reporter landed does not ignore
+# the counter request further down -- it dies on it, and every step after that
+# fails for a reason with nothing to do with what it was testing. Checked once,
+# here, with the fix in the message.
+step "checking the bridge reports its counters"
+bridge_boot_log="$(docker compose logs --no-color telemetry-bridge)"
+grep -q 'ingest reporter:' <<<"$bridge_boot_log" \
+  || fail "the running telemetry-bridge never announced its ingest reporter, so it predates the counter report this script asserts on -- and SIGUSR2 would kill it rather than being handled. Rebuild the image: (cd ../telemetry-bridge && npm run images:build), then docker compose --profile farm up -d --force-recreate telemetry-bridge"
+echo "[farm-e2e] the bridge announced its ingest reporter — counters are readable"
+
 step "starting the mock sensor fleet"
-docker compose --profile mock up -d mock-sensors
+# `--build` on this first start only. Unlike the three farm images, which are
+# built in a telemetry-bridge checkout and consumed by tag, mock-sensors is
+# built from this repo -- and compose reuses an existing image rather than
+# rebuilding it, so a checkout that changed the fleet (the broken-codec device
+# below is exactly that) would otherwise run the previous build and fail a step
+# for a reason that has nothing to do with the bridge. Cached after the first
+# run, so this costs nothing on a warm bench.
+docker compose --profile mock up -d --build mock-sensors
 
 # ── the pipeline ──────────────────────────────────────────────────────────────
 
@@ -1026,18 +1157,274 @@ dupes="$(farm_psql "SELECT count(*) FROM (SELECT device_id, metric, channel, mea
 [ "$dupes" = "0" ] || fail "$dupes reading key(s) appear more than once -- telemetry.reading's primary key is no longer enforcing idempotency"
 echo "[farm-e2e] no reading key appears twice — idempotency survived the cycle"
 
+# ── malformed data through the real pipe ─────────────────────────────────────
+#
+# The seven failures above each break a *component*. These break the *data*,
+# which is the other half of what a farm sends and the half this bench has
+# never seen: the adapter's malformed shapes are covered in-process by the
+# telemetry-bridge repo's db:exercise:adapter, and nothing here ever put one
+# through ChirpStack, mosquitto and the packaged daemon.
+#
+# One of them matters more than the rest. The bridge is serial and acks only
+# after committing, so a message it fails to ack stays at the head of the
+# broker's queue for this session and is redelivered forever -- and everything
+# behind it waits. A poison message that is not acked therefore does not lose a
+# message, it stops the farm, silently, until someone looks. That is the step
+# below and it is why this section exists.
+#
+# Fixture identity: reserved DevEUIs in the fe0000000000000x range, which no
+# mock sensor uses (they are f0000000000000xx) and no real device will. Their
+# ingest_event rows carry source_event_ids that ChirpStack's archive has never
+# heard of, which is harmless -- the loss comparison is `comm -23 archived
+# captured`, one-directional, so an id in farmdata and not in the archive is
+# invisible to it. The inventory reconciler will eventually deactivate these
+# devices for the same reason (absent from a complete ChirpStack listing), which
+# is also harmless: deactivation is a flag, and every assertion here reads
+# ingest_event and reading.
+
+step "malformed data: a poison message in the middle of an offline backlog"
+
+POISON_EUI="fe00000000000001"
+POISON_TOPIC="application/00000000-0000-4000-8000-00000000e2e1/device/${POISON_EUI}/event/up"
+
+docker compose stop telemetry-bridge
+# One round of real uplinks queued ahead of the poison, so the poison is
+# genuinely in the *middle* of a backlog rather than at the front of it.
+sleep "$MOCK_INTERVAL_SECONDS"
+
+# Two shapes, because they fail at different places and only one of them is a
+# parse error. The first never becomes JSON; the second is perfectly good JSON
+# that is not a ChirpStack event, so it gets as far as the mapper and is
+# refused for having no deviceInfo. Both are pure functions of the bytes, which
+# is exactly why the adapter acks them: a redelivery cannot fix content, so
+# withholding the ack would wedge this queue forever.
+publish_app_event "$POISON_TOPIC" 'this is not json at all {'
+publish_app_event "$POISON_TOPIC" '{"hello":"world"}'
+echo "[farm-e2e] two poison messages published into the backlog"
+
+# And more real uplinks behind them. This is the half that catches a wedge:
+# with nothing queued after the poison, a queue stuck on it would still look
+# drained.
+sleep $(( MOCK_INTERVAL_SECONDS * 2 ))
+
+required_ids="$(archived_uplink_ids)"
+backlog_ids="$(LC_ALL=C comm -23 <(printf '%s\n' "$required_ids") <(captured_uplink_ids))"
+backlog="$(id_count "$backlog_ids")"
+[ "$backlog" -gt 0 ] \
+  || fail "the broker was handed nothing to hold -- no uplink was archived while the bridge was down, so this step would prove nothing"
+echo "[farm-e2e] the broker is holding ${backlog} uplink(s), with two poison messages among them"
+
+docker compose start telemetry-bridge
+# THE assertion. If either poison were left unacked it would sit at the head of
+# this session's queue being redelivered, and none of the real uplinks behind it
+# would ever arrive -- so this goes red naming them rather than timing out
+# silently.
+wait_for_capture_of "backlog drained past two poison messages (${backlog} uplink(s) queued)" \
+  "$required_ids" 180
+echo "[farm-e2e] the poison did not wedge the queue — everything behind it drained"
+
+# The counters are the only place the poison itself left a trace: neither
+# message produced a row, by design. Absolute rather than delta here, and only
+# here: the `start` above is a new process, so these counters began at zero
+# moments ago and nothing else has touched them.
+poison_report="$(bridge_report "after the poison drained")"
+poison_json="$(report_field "$poison_report" '.jsonParseFailures')"
+poison_shape="$(report_field "$poison_report" '.droppedMissingField')"
+[ "$poison_json" = "1" ] \
+  || fail "expected exactly 1 jsonParseFailure in the restarted daemon, got \"$poison_json\" -- a payload that is not JSON must be counted, not silently dropped"
+[ "$poison_shape" = "1" ] \
+  || fail "expected exactly 1 droppedMissingField in the restarted daemon, got \"$poison_shape\" -- valid JSON that is not a ChirpStack event must be counted"
+echo "[farm-e2e] both poison messages were acked and counted: jsonParseFailures=${poison_json} droppedMissingField=${poison_shape}"
+
+# Neither poison carried a deviceInfo, so neither could name a device -- which
+# means the evidence that they were discarded rather than captured is that no
+# device was ever minted for the DevEUI they were addressed to.
+poison_device="$(device_id_of "$POISON_EUI")"
+[ -z "$poison_device" ] \
+  || fail "the poison messages minted a device (${poison_device}) -- garbage must be counted and discarded, not captured"
+echo "[farm-e2e] neither poison message left a row behind"
+
+step "malformed data: timestamps a decoder should never emit"
+
+# No restart in this step, so these are deltas against a mark taken now.
+ts_before="$(bridge_report "before the bad-timestamp fixtures")"
+
+TS_FUTURE_EUI="fe00000000000002"
+TS_PAST_EUI="fe00000000000003"
+FUTURE_EVENT_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
+HISTORY_EVENT_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
+NOW_ISO="$(node -e 'process.stdout.write(new Date().toISOString())')"
+FUTURE_ISO="$(node -e 'process.stdout.write(new Date(Date.now() + 10 * 60 * 1000).toISOString())')"
+ANCIENT_ISO="$(node -e 'process.stdout.write(new Date(Date.now() - 4 * 365 * 24 * 3600 * 1000).toISOString())')"
+
+# A whole message ten minutes ahead. `occurred_at` is a *delivery* time and the
+# raw table's partition key, so it has no legitimate reason to sit far from now:
+# a row landing beyond the premade partitions goes to the kept default
+# partition, and a default partition holding a row for a month refuses to give
+# that month up -- creating the partition later fails, maintenance stalls, and
+# the bridge's role holds no DELETE to clean it up. One discarded message with
+# an impossible clock is much the cheaper loss, so the message is dropped whole:
+# no reading, and no raw capture either.
+publish_app_event "application/00000000-0000-4000-8000-00000000e2e1/device/${TS_FUTURE_EUI}/event/up" \
+  "{\"deduplicationId\":\"${FUTURE_EVENT_ID}\",\"time\":\"${FUTURE_ISO}\",\"deviceInfo\":{\"devEui\":\"${TS_FUTURE_EUI}\",\"deviceName\":\"farm-e2e-future-clock\"},\"fPort\":1,\"fCnt\":1,\"object\":{\"battery\":3.7}}"
+
+# And a message whose own delivery time is fine but which carries one ancient
+# reading. This has to come through history[] rather than the event's own time:
+# the ChirpStack adapter derives both occurred_at and measured_at from that one
+# `time`, so a single bad clock costs the whole message and never one reading.
+# A history entry carries its own instant, which is the only place the two can
+# disagree -- and the blast radius is deliberately different there: the reading
+# is dropped and the raw capture is kept.
+publish_app_event "application/00000000-0000-4000-8000-00000000e2e1/device/${TS_PAST_EUI}/event/up" \
+  "{\"deduplicationId\":\"${HISTORY_EVENT_ID}\",\"time\":\"${NOW_ISO}\",\"deviceInfo\":{\"devEui\":\"${TS_PAST_EUI}\",\"deviceName\":\"farm-e2e-ancient-history\"},\"fPort\":1,\"fCnt\":1,\"object\":{\"battery\":3.7,\"history\":[{\"time\":\"${ANCIENT_ISO}\",\"battery\":3.6}]}}"
+
+# Wait on the one that is supposed to land, which also bounds the one that is
+# not: the bridge is serial, so a capture for the second message proves the
+# first has already been processed and decided about.
+wait_for "the ancient-history message was captured" \
+  "SELECT count(*) FROM telemetry.ingest_event WHERE source_event_id = '${HISTORY_EVENT_ID}'" "-ge 1" 60
+
+future_rows="$(farm_psql "SELECT count(*) FROM telemetry.ingest_event WHERE source_event_id = '${FUTURE_EVENT_ID}'")"
+[ "$future_rows" = "0" ] \
+  || fail "a message timestamped 10 minutes in the future left a raw capture -- it must be dropped whole, or its occurred_at parks a row in the default partition that nothing here can remove"
+# The message is refused before device resolution, so there is no device to
+# hang a reading on -- which is itself the assertion.
+future_device="$(device_id_of "$TS_FUTURE_EUI")"
+[ -z "$future_device" ] \
+  || fail "the future-clock message minted a device (${future_device}) -- it must be refused before anything is written"
+echo "[farm-e2e] the future-clock message was dropped whole — no capture, no readings"
+
+ancient_device="$(device_id_of "$TS_PAST_EUI")"
+[ -n "$ancient_device" ] || fail "the ancient-history message minted no device, so its readings cannot be checked"
+ancient_readings="$(farm_psql "SELECT count(*) FROM telemetry.reading WHERE device_id = '${ancient_device}' AND measured_at < now() - interval '3 years'")"
+[ "$ancient_readings" = "0" ] || fail "$ancient_readings reading(s) older than the backfill bound landed"
+fresh_readings="$(farm_psql "SELECT count(*) FROM telemetry.reading WHERE device_id = '${ancient_device}' AND measured_at >= now() - interval '3 years'")"
+[ "$fresh_readings" -ge 1 ] \
+  || fail "the ancient history entry took its message's good readings down with it -- a bad measured_at must drop that reading only"
+echo "[farm-e2e] the ancient reading was dropped and its message kept — ${fresh_readings} good reading(s) landed"
+
+ts_after="$(bridge_report "after the bad-timestamp fixtures")"
+assert_counter "the future-clock message" "$ts_before" "$ts_after" '.writer.envelopesSkippedBadTimestamp' 1
+# Two, not one, and the arithmetic is the assertion. A message dropped for its
+# occurred_at rolls its own readings into this total as it goes -- what keeps
+# the report reconcilable, since a reading that vanished with its message would
+# otherwise leave no trace anywhere in the numbers. So: 1 from the future-clock
+# message's single `battery` reading, going down with the message, and 1 from
+# the ancient history entry, which is the only one of the two that was dropped
+# *as a reading*. Asserting 1 here would be asserting that the whole-message
+# drop is silent in this counter, which is exactly what it must not be.
+assert_counter "the two bad timestamps" "$ts_before" "$ts_after" '.writer.readingsSkippedBadTimestamp' 2
+
+step "malformed data: a redelivery that can actually be seen"
+
+# The assertion this bench could not make before the daemon reported its
+# counters. Every trace of a successful redelivery is collapsed by a primary
+# key -- reading, reading_latest, ingest_event and device_event all dedupe on
+# conflict -- so from out here a replay that was deduped and a redelivery that
+# never happened produce identical rows. The kill step's duplicate-key query is
+# a schema guard for exactly that reason and says so.
+#
+# Published twice on purpose rather than harvested from the SIGKILL step, which
+# cannot carry it: the bridge drains far faster than the fleet publishes, so it
+# is idle at the instant of most kills and there is frequently nothing unacked
+# to redeliver. That would be a flake, not a proof.
+REPLAY_EUI="fe00000000000004"
+REPLAY_EVENT_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
+REPLAY_ISO="$(node -e 'process.stdout.write(new Date().toISOString())')"
+REPLAY_MSG="{\"deduplicationId\":\"${REPLAY_EVENT_ID}\",\"time\":\"${REPLAY_ISO}\",\"deviceInfo\":{\"devEui\":\"${REPLAY_EUI}\",\"deviceName\":\"farm-e2e-replay\"},\"fPort\":1,\"fCnt\":1,\"object\":{\"battery\":3.7}}"
+
+replay_before="$(bridge_report "before the redelivery")"
+publish_app_event "application/00000000-0000-4000-8000-00000000e2e1/device/${REPLAY_EUI}/event/up" "$REPLAY_MSG"
+wait_for "the first delivery was captured" \
+  "SELECT count(*) FROM telemetry.ingest_event WHERE source_event_id = '${REPLAY_EVENT_ID}'" "-ge 1" 60
+publish_app_event "application/00000000-0000-4000-8000-00000000e2e1/device/${REPLAY_EUI}/event/up" "$REPLAY_MSG"
+
+# Poll the counter rather than the rows: the rows are identical either way,
+# which is the whole problem this step exists to solve.
+replay_deadline=$(( $(date +%s) + 60 ))
+while :; do
+  replay_after="$(bridge_report "after the redelivery")"
+  replayed=$(( $(report_field "$replay_after" '.writer.envelopesReplayed') - $(report_field "$replay_before" '.writer.envelopesReplayed') ))
+  [ "$replayed" -lt 1 ] || break
+  [ "$(date +%s)" -lt "$replay_deadline" ] \
+    || fail "the same message delivered twice was never counted as a replay (envelopesReplayed rose by ${replayed}) -- either it was not processed, or idempotency is being done by something other than the conflict this counter watches"
+  sleep 2
+done
+echo "[farm-e2e] the redelivery was seen and counted: envelopesReplayed +${replayed}"
+
+replay_rows="$(farm_psql "SELECT count(*) FROM telemetry.ingest_event WHERE source_event_id = '${REPLAY_EVENT_ID}'")"
+[ "$replay_rows" = "1" ] || fail "the redelivered message left ${replay_rows} raw captures, not 1"
+# One reading, from a message delivered twice. Counted on the device rather
+# than as a readingsInserted delta: the mock fleet is publishing throughout, so
+# that counter is rising for reasons that have nothing to do with this step.
+# Keyed on this message's own instant, not on the device: the fixture publishes
+# a fresh timestamp each run, so on a kept bench the device carries one reading
+# per previous run and a bare count would climb past 1 for a reason that has
+# nothing to do with idempotence.
+replay_device="$(device_id_of "$REPLAY_EUI")"
+replay_readings="$(farm_psql "SELECT count(*) FROM telemetry.reading WHERE device_id = '${replay_device}' AND measured_at = '${REPLAY_ISO}'::timestamptz")"
+[ "$replay_readings" = "1" ] \
+  || fail "the redelivered message left ${replay_readings} reading(s) at its own instant, not 1"
+echo "[farm-e2e] and it inserted nothing the second time — idempotence, observed rather than inferred"
+
+step "malformed data: a device whose codec fails"
+
+# No injection: this device has been in the fleet since boot, publishing real
+# bytes behind a codec that throws. What it proves is the claim everything
+# downstream rests on and nothing here tested -- ingestion is never gated on
+# decode. It is also the only assertion in this section that involves ChirpStack
+# at all: a synthetic publish could show the bridge handling an object-less
+# event, but only a real device shows that ChirpStack *publishes* one when the
+# decoder raises.
+BROKEN_EUI="f000000000000018"
+
+broken_device="$(device_id_of "$BROKEN_EUI")"
+[ -n "$broken_device" ] \
+  || fail "the broken-codec device was never created -- a device whose payload never decodes must still be minted from its uplinks"
+
+broken_captures="$(farm_psql "SELECT count(*) FROM telemetry.ingest_event WHERE device_id = '${broken_device}' AND event_type = 'up'")"
+[ "$broken_captures" -ge 1 ] \
+  || fail "no uplink from the broken-codec device reached telemetry.ingest_event -- either ChirpStack swallowed the event when its codec threw, or ingestion is gated on decode"
+
+# Not "zero readings" -- "zero readings *from the payload*". The adapter mints
+# gatewayRssi/gatewaySnr from the uplink's rxInfo whenever FARM_BRIDGE_SIGNAL_HEALTH
+# is on, which is the bench default, and those come from radio metadata rather
+# than from anything the codec produced. So a device with no decode still reports
+# how well it was heard, which is worth having and is exactly not what this step
+# is about. Asserting a flat 0 here would have been asserting the signal-health
+# feature away, and it is what the first run of this step did.
+broken_payload_readings="$(farm_psql "SELECT count(*) FROM telemetry.reading WHERE device_id = '${broken_device}' AND metric NOT IN ('gatewayRssi', 'gatewaySnr')")"
+[ "$broken_payload_readings" = "0" ] \
+  || fail "${broken_payload_readings} decoded reading(s) came from a device whose codec throws -- there is nothing to decode, so the fleet is no longer sending what this step thinks it is"
+broken_signal_readings="$(farm_psql "SELECT count(*) FROM telemetry.reading WHERE device_id = '${broken_device}' AND metric IN ('gatewayRssi', 'gatewaySnr')")"
+[ "$broken_signal_readings" -ge 1 ] \
+  || fail "the broken-codec device produced no signal-health readings either, so its uplinks were not processed at all and the zero above proves nothing"
+echo "[farm-e2e] the broken-codec device: ${broken_captures} raw capture(s), 0 decoded readings, ${broken_signal_readings} signal-health reading(s) — ingestion is not gated on decode"
+
+# And its uplinks are in both stores, like everyone else's. The end-of-run
+# comparison covers this too; saying it here is what makes a failure
+# attributable to the decode path rather than to whichever step ran last.
+broken_missing="$(LC_ALL=C comm -23 \
+  <(events_psql "SELECT lower(deduplication_id::text) FROM event_up WHERE lower(dev_eui) = '${BROKEN_EUI}'" | LC_ALL=C sort) \
+  <(captured_uplink_ids))"
+[ -z "$broken_missing" ] \
+  || fail "$(id_count "$broken_missing") uplink(s) from the broken-codec device are in the archive and not in farmdata"
+echo "[farm-e2e] every uplink it sent reached farmdata, decoded or not"
+
 step "stopping the mock fleet"
 docker compose --profile mock stop mock-sensors
 sleep 5
 
-# ── nothing was lost across the seven failures ────────────────────────────────
+# ── nothing was lost across the seven failures, or the malformed data ────────
 
-step "asserting nothing was lost across the seven failures"
+step "asserting nothing was lost across the seven failures and the bad data"
 
 # The captured-vs-archived comparison up top ran before any failure was injected.
-# This is that same assertion after all seven of them, and it is the one that
-# holds regardless of which step a loss would be attributable to: whatever
-# ChirpStack received across the whole run, the bridge has.
+# This is that same assertion after all seven of them and after the malformed
+# data, and it is the one that holds regardless of which step a loss would be
+# attributable to: whatever ChirpStack received across the whole run, the bridge
+# has. The synthetic fixtures do not disturb it -- they are in farmdata and not
+# in the archive, and this comparison is one-directional.
 #
 # Polled rather than slept on. The bridge is serial and acks after commit, so it
 # is still draining what the broker held when the publisher stopped, and how long

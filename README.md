@@ -390,13 +390,47 @@ own: it takes the connection error, exits, and comes back only because it carrie
 looks at the response body rather than the port, because PostGraphile stays up and listening while
 it retries introspection, answering nothing but errors.
 
+**Then it sends the path bad data**, which is the other half of what a farm produces and the half
+this bench never saw. Four steps, and the first is why the section exists: the bridge is serial and
+acknowledges a message only after committing it, so a message it fails to ack stays at the head of
+the broker's queue and is redelivered forever with everything behind it waiting. A poison message
+that is not acked therefore does not lose one reading — it stops the farm, silently, until somebody
+notices. So garbage is published into the middle of an offline backlog, real uplinks on both sides
+of it, and the whole backlog has to drain past it. Then timestamps a decoder should never emit: a
+message ten minutes in the future, which is dropped **whole** because `occurred_at` is the raw
+table's partition key and a row in the kept default partition blocks that month's partition from
+ever being created; and an ancient reading inside a `history[]` entry, where the blast radius is
+deliberately different — that reading is dropped and the raw capture is kept. Then a redelivery,
+published twice on purpose. And last, a device whose ChirpStack codec throws on every uplink, whose
+raw capture has to land with **no decoded readings**, because ingestion is never gated on decode.
+Not *zero* readings: the adapter mints `gatewayRssi`/`gatewaySnr` from the uplink's `rxInfo`
+whenever `FARM_BRIDGE_SIGNAL_HEALTH` is on, which is radio metadata rather than anything the codec
+produced — so a device with no working decoder still reports how well it was heard, and the step
+asserts that too, since a device with no uplinks at all would satisfy the zero on its own.
+
+**Two of those are only assertable because the daemon now reports its counters.** A message the
+bridge drops deliberately leaves no row to find, and a redelivery that was correctly deduped leaves
+exactly the rows a redelivery that never happened would — every trace of a successful replay is
+collapsed by a primary key. So the bridge logs `getReport()` on an interval
+(`FARM_BRIDGE_REPORT_INTERVAL_SECONDS`, default 300), once more on shutdown, and immediately on
+`SIGUSR2`, which is what the script uses: `docker compose kill -s USR2 telemetry-bridge` and read
+the `ingest report:` line. The one trap is worth knowing before writing another step on it — **a
+bridge restart is a new process and every counter starts at zero**, so a mark taken before a step
+that stops or kills the bridge is not a baseline for anything after it.
+
+The broken-codec device is a real one, provisioned by `mock-sensors` like the other 23, sending real
+decode-verified bytes behind a profile carrying a codec that raises. That is the only way to learn
+what ChirpStack itself does with a failing decoder — it publishes and archives the uplink anyway,
+with no `object` — which is the fact everything downstream rests on.
+
 ```sh
 bash scripts/farm-e2e.sh              # tears the stack down afterwards
 FARM_E2E_KEEP=1 bash scripts/farm-e2e.sh   # leave it running (fast iteration)
 ```
 
-It takes upwards of a quarter of an hour, most of it waiting on uplink rounds, on containers
-stopping and starting, and on the one checkpoint interval the killed-broker step sits through. Counts are asserted
+It takes around twenty minutes, most of it waiting on uplink rounds, on containers
+stopping and starting, on the one checkpoint interval the killed-broker step sits through, and on
+the offline backlog the poison step has to build before it has anything to drain. Counts are asserted
 as floors, never as exact fleet totals: `mock-sensors` sends one unacknowledged UDP datagram per
 uplink with no retransmit, so an occasional frame never reaches ChirpStack at all, and that is a
 transport flake rather than a bridge regression. What proves nothing was lost is the comparison

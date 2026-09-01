@@ -17,9 +17,9 @@ in both sinks.
 
 ## The mocked sensors
 
-23 sensors, each backed by a real normalized codec from
+24 sensors, 23 of them backed by a real normalized codec from
 [`@intelligent-farming/lorawan-codec-normalization`](https://github.com/intelligent-farming/lorawan-codec-normalization).
-They fall into two groups with different jobs.
+They fall into three groups with different jobs.
 
 **Wire-format & shape coverage** — a spread of payload formats and output shapes:
 
@@ -56,6 +56,23 @@ SenseCAP S2120 plus the **whole** Makerfabs AgroSense line (every device under
 | `makerfabs/none-position-rope-water-leak` | water-leak | 1 | 1 | ┘ |
 | `makerfabs/gps-tracker-neo-6m` | gps-tracker | 1 | 3 | ┐ one shared wire format |
 | `makerfabs/gps-tracker-pa1010d` | gps-tracker | 1 | 2 | ┘ |
+
+**Decode failure** — one device whose ChirpStack device profile carries a codec that
+throws on every uplink.
+
+| Sensor | Category | fPort | Vectors | Notes |
+|--------|----------|-------|---------|-------|
+| `broken-codec` | soil-monitor | 1 | 2 | real `dragino/lse01` bytes, deliberately broken decoder |
+
+The bytes on the wire are real and would decode — it reuses `dragino/lse01`'s own
+vectors — and only the script installed in ChirpStack is swapped. That is the point:
+a device whose payload is perfectly good and whose *decoder* has a bug is what a
+fleet actually meets, and it is the only way to see what ChirpStack does with one.
+It publishes and archives the uplink anyway, with no `object` attached, which is the
+fact the farm telemetry path's "ingestion is never gated on decode" rests on.
+Nothing downstream can learn its category, because category comes from the decoded
+make/model and there is no decode — so it also gives the bench one device in the
+state an operator has to curate by hand.
 
 The families are mocked whole rather than sampled one-per-category on purpose: the
 codecs of the three shared-wire-format groups above are *supposed* to agree on their
@@ -155,7 +172,7 @@ have to remember the flags). From elsewhere, prefix with `npm --prefix mock-sens
 
 ## Continuous emission
 
-The `mock` profile runs the emitter **continuously**: it loops over all 23 sensors every
+The `mock` profile runs the emitter **continuously**: it loops over all 24 sensors every
 `MOCK_INTERVAL_SECONDS` (default 15) forever, so fresh decoded readings keep arriving in Postgres and
 on the MQTT stream until you stop it. The container is `restart: unless-stopped`, so it survives
 restarts too. Use a faster cadence with, e.g., `MOCK_INTERVAL_SECONDS=5 npm run stack:up`.
@@ -198,8 +215,9 @@ bash scripts/e2e.sh
 ```
 
 The suite (`test/e2e.test.ts`) provisions, sends every known payload of every sensor
-(52 uplinks across the 23 devices), and asserts each decoded `object` shows up on
-MQTT **and** in `event_up`.
+across the 24 devices, and asserts each decoded `object` shows up on MQTT **and**
+in `event_up` — except the broken-codec device, where it asserts the opposite:
+the uplink arrives and is archived with nothing decoded attached.
 
 `scripts/e2e.sh` handles the setup a bare `npm run test:e2e` cannot:
 

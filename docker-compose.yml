@@ -483,6 +483,13 @@ services:
       FARM_BRIDGE_CURATION_PORT: "8091"
       FARM_BRIDGE_CURATION_LAG_DAYS: ${FARM_BRIDGE_CURATION_LAG_DAYS:-7}
       FARM_BRIDGE_CURATION_CHECK_INTERVAL_SECONDS: ${FARM_BRIDGE_CURATION_CHECK_INTERVAL_SECONDS:-3600}
+      # How often the daemon logs its ingest counters. They are the only
+      # outside evidence that a message was dropped deliberately rather than
+      # lost, and that a redelivery was deduped rather than never sent --
+      # every trace of a successful replay is otherwise collapsed by a primary
+      # key. scripts/farm-e2e.sh asks for one on demand with SIGUSR2 rather
+      # than waiting out this interval.
+      FARM_BRIDGE_REPORT_INTERVAL_SECONDS: ${FARM_BRIDGE_REPORT_INTERVAL_SECONDS:-300}
     volumes:
       - shared:/shared:ro                                    # the provisioner's config.json
       - ./farm/bridge-entrypoint.sh:/farm/bridge-entrypoint.sh:ro
