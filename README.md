@@ -296,7 +296,17 @@ where to look: `docker compose logs farmdata-migrate`.
 `scripts/farm-e2e.sh` boots the farm profile with the mock fleet and walks the whole path: uplinks
 land as normalized, property-stamped readings, every metric resolves in the dictionary, the store
 answers GraphQL, a device is curated through the curation API, and the curation-lag alarm is
-asserted by its exit code. It then puts the path under the nine failures it has to survive — the
+asserted by its exit code. Two properties are seeded rather than one, so **property stamping across
+a placement change** is provable at all: a device is moved onto the second through the curation API
+and its readings split at the move instant — everything measured before it keeps the property it was
+measured under, everything after takes the new one. A synthetic message carries the sharp edge, since
+the mock fleet has no datalogger to emit one: a single uplink whose `history[]` entry is timestamped
+inside the closed window and whose own reading is measured now lands **two readings on two
+properties from one batch**, which is the whole of what "as of measurement time" means. It also
+publishes a `join` and a `status` event so `telemetry.device_event` is exercised, and redelivers
+both to prove the lifecycle key dedupes — those are fixtures because they have to be: the mock fleet
+is ABP-activated and requests no device status, so ChirpStack publishes neither event for it. It then
+puts the path under the nine failures it has to survive — the
 database stopped underneath it, the bridge stopped while the broker keeps receiving, the bridge
 killed outright, then the broker itself restarted under a live bridge, restarted with a backlog
 queued, and killed outright, then the whole box power-cycled at once, and finally the database and
@@ -513,6 +523,39 @@ indistinguishable. Successful idempotence is silent by construction. What this s
 after the kill is that ingestion resumed and nothing was lost; that the replay wrote nothing twice
 is asserted in the bridge repo, against counters.
 
+The same split applies to the placement steps. What the bench proves is the claim through the real
+pipe: a real fleet device moved through the real curation API, whose readings then accumulate either
+side of the move for the rest of the run and are split at the end. What the bridge repo's
+`npm run db:exercise:placement` adds is the case this script deliberately leaves out — a *backdated*
+correction, which does **not** re-stamp readings already stored. That has to live over there: a
+device whose history was corrected retroactively is exactly a device whose stored stamps no longer
+agree with its current windows, and this run ends by asserting that agreement over every reading in
+the database. Deterministic proof there, exact invariant here.
+
+**The run ends with four cross-table sweeps**, and they are last because that is the only moment
+nothing is racing and there is a full run's worth of rows to be wrong about. `reading_latest` must
+equal the true newest reading for every `(device, metric, channel)` — timestamp *and* value, since an
+intra-batch collision resolved one way in the fact table and the other in the mirror would publish a
+value no reading row holds. Every reading a placement window covers must carry that window's
+property; the readings no window covers are counted and explained rather than ignored, and there are
+two honest reasons for one — a device's first uplink is measured a moment *before* the window
+auto-registration opens for it, and a codec may supply its own measurement `time`, so a datalogger
+reading can legitimately predate the device's registration by months (this bench's GPS tracker emits
+one about seventy days back). Both take the writer's documented fallback. What is *not* honest is an
+uncovered reading measured **after** its device's history began: that means the history has a gap and
+the fallback answered for a measurement some window should have owned, and it is asserted to be zero.
+The moved device's split is asserted per row against the move instant the API wrote. And the
+lifecycle fixtures are still exactly the rows they wrote.
+
+Then the posture the rest of it rests on: **every published `farm` port is asserted to be bound to
+`127.0.0.1`**, read out of the running containers rather than out of `docker-compose.yml` so an
+`.env` override is caught too. The curation API writes and has no authentication and no TLS; the
+GraphQL layer exposes every reading with GraphiQL on. Both are safe on this bench only because of
+that bind, so a compose edit dropping the prefix would publish an unauthenticated write API to the
+network — and until this step, nothing in the run would have noticed. Scoped to the farm profile
+deliberately: mosquitto, ChirpStack, its REST gateway, both gateway bridges and Leftenant are
+published unbound on purpose, being the LAN-facing half of the bench.
+
 ### Querying it
 
 ```sh
@@ -584,10 +627,18 @@ header is refused with 403 — deliberately, since there is no auth to protect a
 
 ### Where the values come from
 
-`farm/projection.json` is the bench's organization and property, and it has exactly one job beyond
+`farm/projection.json` is the bench's organization and properties, and it has exactly one job beyond
 seeding: `FARM_BRIDGE_PROPERTY_ID` is left blank in `.env` and derived from this file's
 `default_property_id`, so the property the seeder writes and the property the bridge uses cannot
 drift apart. Point at a real property by editing this file, not by pasting a UUID in two places.
+
+It seeds **two** properties — Bench Field, which is the default every uncurated device lands on, and
+Bench South Field, which exists so there is somewhere to move a device *to*. That is not decoration:
+with one property seeded, "every reading is stamped with the property valid when it was measured" has
+only one answer it could possibly give, and the end-to-end script's placement steps would be
+asserting nothing. Adding a property is an addition to `properties[]` and nothing else — the seeder
+upserts on every `up`, and leaving `default_property_id` alone keeps the bridge's derivation and
+every existing assertion unchanged.
 
 The ChirpStack API key the inventory reconciler uses is read from `/shared/config.json` — minted by
 the provisioner at run time, so no environment variable can carry it. That is the same file

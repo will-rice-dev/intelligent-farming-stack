@@ -732,6 +732,172 @@ set -e
 [ "$lag_code" = "0" ] || fail "curation-lag should exit 0 once nothing is lagging, got $lag_code"
 echo "[farm-e2e] curation-lag exits 0 — the alarm is quiet again"
 
+# ── property stamping across a placement change ───────────────────────────────
+#
+# The design's marquee claim: a reading belongs to the property where it was
+# measured, even after the device moves. Everything above only ever confirmed
+# the *default* placement -- with one property seeded there was no other answer
+# a stamp could have had -- so this is the first step here that can be wrong.
+#
+# Two halves, because they prove different things and neither covers the other.
+#
+# Half A moves a real fleet device through the real curation API and leaves it
+# moved. Nothing is asserted about its readings here: the resilience steps
+# below run the fleet for the rest of the run, so the post-move traffic
+# accumulates for free, and the split is asserted at the end once everything
+# has settled. That ordering is the point -- the claim survives the nine
+# failures rather than being made in a quiet moment before them.
+#
+# Half B is the sharp edge, and it is synthetic because it has to be: it needs
+# one message carrying readings measured either side of a move instant, which
+# is a datalogger's history[] and not something the mock fleet emits. One
+# message, one writer batch, two properties.
+#
+# What is deliberately *not* here: a backdated correction. The bridge repo's
+# db:exercise:placement pins that (a correction does not re-stamp readings
+# already stored), and it has to, because a device whose history was corrected
+# retroactively is precisely a device whose stored stamps no longer agree with
+# its current windows -- which would put a permanent exception into the
+# whole-database sweep at the end of this run. Deterministic proof there,
+# exact invariant here.
+
+step "property stamping across a placement change"
+
+south_property="$(node -e '
+  const seed = JSON.parse(require("fs").readFileSync("farm/projection.json", "utf8"));
+  const other = seed.properties.find((p) => p.property_id !== seed.default_property_id);
+  if (other === undefined) throw new Error("the projection seeds only one property");
+  process.stdout.write(other.property_id);
+')"
+[ -n "$south_property" ] || fail "the projection seed names no second property to move a device onto"
+
+# The seeder is the only thing that may write these rows, so this is also the
+# assertion that the second property actually reached the database rather than
+# only the file.
+seeded="$(farm_psql "SELECT count(*) FROM registry.property WHERE property_id = '${south_property}'")"
+[ "$seeded" = "1" ] || fail "the second property ${south_property} is in the seed file but not in farmdata"
+echo "[farm-e2e] both properties are seeded; moving a device onto ${south_property}"
+
+# ── half A: a real fleet device, through the real pipe ───────────────────────
+#
+# Deliberately not the device the curation step above placed: failure 7 asserts
+# that device's operator-written window survived a power cycle, and moving it
+# here would be asserting two different things about one row.
+moved_device="$(farm_psql "SELECT d.device_id FROM registry.device d
+   JOIN registry.device_identity i ON i.device_id = d.device_id AND i.scheme = 'dev_eui'
+  WHERE d.auto_created = true
+    AND d.device_id <> '${device_id}'
+    AND EXISTS (SELECT 1 FROM telemetry.reading r WHERE r.device_id = d.device_id)
+  ORDER BY i.id_value
+  LIMIT 1")"
+[ -n "$moved_device" ] || fail "no second reporting device to move -- the fleet should have provided one"
+
+pre_move_readings="$(farm_psql "SELECT count(*) FROM telemetry.reading WHERE device_id = '${moved_device}'")"
+[ "$pre_move_readings" -gt 0 ] || fail "the device chosen to move has no readings yet, so a split cannot be observed"
+
+move="$(curation_post "/v1/devices/${moved_device}/assignment" \
+  "{\"propertyId\":\"${south_property}\",\"actor\":\"farm-e2e-operator\"}")"
+move_changed="$(printf '%s' "$move" | json_field '.changed')"
+move_reason="$(printf '%s' "$move" | json_field '.reason')"
+[ "$move_changed" = "true" ] || fail "moving a device to a different property must write: $move"
+# `reassigned` rather than `confirmed_placement`: the property actually changed.
+# The curation step above asserted the other branch of that same decision.
+[ "$move_reason" = "reassigned" ] || fail "expected reason reassigned, got \"$move_reason\": $move"
+
+# The move instant, taken from the row the API wrote rather than from this
+# script's clock: the API stamps windows with the database's `now()`, and the
+# split asserted at the end has to be measured against the same boundary the
+# writer will resolve readings against.
+move_at="$(farm_psql "SELECT to_char(upper(valid_range) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.USOF')
+   FROM registry.device_assignment
+  WHERE device_id = '${moved_device}' AND NOT upper_inf(valid_range)
+  ORDER BY upper(valid_range) DESC LIMIT 1")"
+[ -n "$move_at" ] || fail "the move closed no window, so there is no boundary to assert against"
+
+# Adjacent, not merely ordered: a gap between the closed and open windows would
+# leave every reading measured inside it with no window to resolve, and the
+# fallback would quietly answer with the device's current property instead.
+adjacent="$(farm_psql "SELECT count(*) FROM registry.device_assignment a
+  WHERE a.device_id = '${moved_device}'
+    AND upper_inf(a.valid_range)
+    AND lower(a.valid_range) = '${move_at}'::timestamptz")"
+[ "$adjacent" = "1" ] || fail "the window the move opened does not begin where the one it closed ended"
+
+open_property="$(farm_psql "SELECT property_id FROM registry.device_assignment
+  WHERE device_id = '${moved_device}' AND upper_inf(valid_range)")"
+[ "$open_property" = "$south_property" ] || fail "the open window names ${open_property}, not ${south_property}"
+echo "[farm-e2e] ${moved_device} moved to ${south_property} at ${move_at} (${pre_move_readings} reading(s) predate it)"
+
+# ── half B: one message, two properties ──────────────────────────────────────
+
+PLACEMENT_EUI="fe00000000000005"
+PLACEMENT_TOPIC="application/00000000-0000-4000-8000-00000000e2e1/device/${PLACEMENT_EUI}/event/up"
+PLACEMENT_CREATE_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
+PLACEMENT_STRADDLE_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
+
+# One uplink to bring the device into being. Auto-registration opens its first
+# window on the default property, which is what the move below then closes.
+publish_app_event "$PLACEMENT_TOPIC" \
+  "{\"deduplicationId\":\"${PLACEMENT_CREATE_ID}\",\"time\":\"$(node -e 'process.stdout.write(new Date().toISOString())')\",\"deviceInfo\":{\"devEui\":\"${PLACEMENT_EUI}\",\"deviceName\":\"farm-e2e-placement\"},\"fPort\":1,\"fCnt\":1,\"object\":{\"battery\":3.7}}"
+
+wait_for "the placement fixture was captured" \
+  "SELECT count(*) FROM telemetry.ingest_event WHERE source_event_id = '${PLACEMENT_CREATE_ID}'" "-ge 1" 60
+
+placement_device="$(device_id_of "$PLACEMENT_EUI")"
+[ -n "$placement_device" ] || fail "the placement fixture minted no device"
+
+# A window with no interior has nowhere to put a reading strictly inside it, and
+# the bounds come back through the driver truncated to the millisecond. One
+# second of separation is the cheapest way to guarantee the interior exists --
+# the same reason the bridge repo's own placement exercise waits here.
+sleep 1
+
+fixture_move="$(curation_post "/v1/devices/${placement_device}/assignment" \
+  "{\"propertyId\":\"${south_property}\",\"actor\":\"farm-e2e-operator\"}")"
+[ "$(printf '%s' "$fixture_move" | json_field '.changed')" = "true" ] \
+  || fail "moving the placement fixture must write: $fixture_move"
+
+# The midpoint of the window the move just closed, computed by the database so
+# it is expressed in the same clock the bounds are. This is the instant the
+# history entry below claims to have measured at, and it must resolve to the
+# *default* property even though the device now sits on the south field.
+fixture_window="$(farm_psql "SELECT to_char(
+     (lower(valid_range) + (upper(valid_range) - lower(valid_range)) / 2) AT TIME ZONE 'UTC',
+     'YYYY-MM-DD\"T\"HH24:MI:SS.MSZ')
+   FROM registry.device_assignment
+  WHERE device_id = '${placement_device}' AND NOT upper_inf(valid_range)")"
+[ -n "$fixture_window" ] || fail "the placement fixture's move closed no window"
+
+# THE assertion this step exists for. One message: its top-level reading is
+# measured now, inside the window the move opened; its history[] entry is
+# measured at the midpoint of the window the move closed. Two readings, one
+# batch, and the writer has to resolve a window per reading rather than per
+# device or per message to get both right.
+publish_app_event "$PLACEMENT_TOPIC" \
+  "{\"deduplicationId\":\"${PLACEMENT_STRADDLE_ID}\",\"time\":\"$(node -e 'process.stdout.write(new Date().toISOString())')\",\"deviceInfo\":{\"devEui\":\"${PLACEMENT_EUI}\",\"deviceName\":\"farm-e2e-placement\"},\"fPort\":1,\"fCnt\":2,\"object\":{\"battery\":3.8,\"history\":[{\"time\":\"${fixture_window}\",\"battery\":3.6}]}}"
+
+wait_for "the straddling message was captured" \
+  "SELECT count(*) FROM telemetry.ingest_event WHERE source_event_id = '${PLACEMENT_STRADDLE_ID}'" "-ge 1" 60
+# The capture is committed in the same transaction as the readings, so by here
+# both rows exist -- but the wait above proves the message was processed, not
+# that it produced two readings, so that is asserted rather than assumed.
+straddle_rows="$(farm_psql "SELECT count(*) FROM telemetry.reading
+  WHERE device_id = '${placement_device}' AND source_event_id = '${PLACEMENT_STRADDLE_ID}'")"
+[ "$straddle_rows" = "2" ] || fail "the straddling message produced ${straddle_rows} reading(s), wanted 2"
+
+historical_property="$(farm_psql "SELECT property_id FROM telemetry.reading
+  WHERE device_id = '${placement_device}' AND measured_at = '${fixture_window}'::timestamptz")"
+[ "$historical_property" = "$default_property" ] \
+  || fail "the history entry measured before the move is stamped ${historical_property}, not the property that was valid then (${default_property})"
+
+current_property="$(farm_psql "SELECT property_id FROM telemetry.reading
+  WHERE device_id = '${placement_device}' AND source_event_id = '${PLACEMENT_STRADDLE_ID}'
+    AND measured_at <> '${fixture_window}'::timestamptz")"
+[ "$current_property" = "$south_property" ] \
+  || fail "the reading measured after the move is stamped ${current_property}, not ${south_property}"
+
+echo "[farm-e2e] one message, two properties — the history entry kept ${default_property}, the live reading took ${south_property}"
+
 # ── resilience, against the real containerized daemon ─────────────────────────
 #
 # The deterministic versions of these live in the telemetry-bridge repo's own
@@ -1744,6 +1910,116 @@ broken_missing="$(LC_ALL=C comm -23 \
   || fail "$(id_count "$broken_missing") uplink(s) from the broken-codec device are in the archive and not in farmdata"
 echo "[farm-e2e] every uplink it sent reached farmdata, decoded or not"
 
+# ── device lifecycle events, through the packaged daemon ──────────────────────
+#
+# `telemetry.device_event` is the one table in the schema this run has never
+# asserted anything about, and readings have taken all the attention because
+# the fleet only ever produces readings: the mock sensors are ABP-activated, so
+# ChirpStack has no join to publish for them, and no device profile here sets a
+# status-request interval, so it has no status report either. An `up` event
+# yields no lifecycle row by design. That is not laziness in the fixtures below
+# -- it is why they have to be fixtures: on this bench the table is empty by
+# construction, and a step asserting "it is empty" would prove nothing at all.
+#
+# The bridge repo's db:exercise:adapter already maps both event types in
+# process. What only the bench can add is the same thing through the *packaged
+# daemon* over the real broker, and the dedupe contract underneath it: the row
+# is keyed (device_id, event_type, occurred_at) and inserted ON CONFLICT DO
+# NOTHING, so a redelivery must add nothing. That is asserted here rather than
+# inferred, because from outside the process a redelivery that was deduped and
+# one that never happened leave identical rows.
+
+step "device lifecycle events through the packaged daemon"
+
+JOIN_EUI="fe00000000000006"
+STATUS_EUI="fe00000000000007"
+JOIN_EVENT_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
+STATUS_EVENT_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
+LIFECYCLE_ISO="$(node -e 'process.stdout.write(new Date().toISOString())')"
+
+join_topic="application/00000000-0000-4000-8000-00000000e2e1/device/${JOIN_EUI}/event/join"
+status_topic="application/00000000-0000-4000-8000-00000000e2e1/device/${STATUS_EUI}/event/status"
+
+join_payload="{\"deduplicationId\":\"${JOIN_EVENT_ID}\",\"time\":\"${LIFECYCLE_ISO}\",\"deviceInfo\":{\"devEui\":\"${JOIN_EUI}\",\"deviceName\":\"farm-e2e-join\"},\"devAddr\":\"01000099\"}"
+status_payload="{\"deduplicationId\":\"${STATUS_EVENT_ID}\",\"time\":\"${LIFECYCLE_ISO}\",\"deviceInfo\":{\"devEui\":\"${STATUS_EUI}\",\"deviceName\":\"farm-e2e-status\"},\"margin\":7,\"externalPowerSource\":false,\"batteryLevelUnavailable\":false,\"batteryLevel\":93.5}"
+
+publish_app_event "$join_topic" "$join_payload"
+publish_app_event "$status_topic" "$status_payload"
+
+wait_for "both lifecycle events landed" \
+  "SELECT count(*) FROM telemetry.device_event WHERE source_event_id IN ('${JOIN_EVENT_ID}', '${STATUS_EVENT_ID}')" \
+  "-ge 2" 60
+
+join_device="$(device_id_of "$JOIN_EUI")"
+status_device="$(device_id_of "$STATUS_EUI")"
+[ -n "$join_device" ] || fail "the join event minted no device"
+[ -n "$status_device" ] || fail "the status event minted no device"
+
+join_type="$(farm_psql "SELECT event_type FROM telemetry.device_event WHERE source_event_id = '${JOIN_EVENT_ID}'")"
+[ "$join_type" = "join" ] || fail "the join event landed as event_type \"$join_type\""
+status_type="$(farm_psql "SELECT event_type FROM telemetry.device_event WHERE source_event_id = '${STATUS_EVENT_ID}'")"
+[ "$status_type" = "status" ] || fail "the status event landed as event_type \"$status_type\""
+
+# The details are the payload's own fields, not a placeholder: a row that
+# landed with an empty jsonb would satisfy every assertion above.
+status_battery="$(farm_psql "SELECT details ->> 'batteryLevel' FROM telemetry.device_event WHERE source_event_id = '${STATUS_EVENT_ID}'")"
+[ "$status_battery" = "93.5" ] \
+  || fail "the status event's details carry batteryLevel \"$status_battery\", not 93.5 — the payload did not reach the row"
+
+# The two event types differ in whether they carry a measurement, and the
+# difference is worth asserting rather than assuming either way. A join carries
+# none — it is an identity event. A status report carries two: `linkMargin`
+# always, and `batteryPercent` only when the device genuinely reported a level.
+join_readings="$(farm_psql "SELECT count(*) FROM telemetry.reading WHERE device_id = '${join_device}'")"
+[ "$join_readings" = "0" ] \
+  || fail "$join_readings reading(s) came from a join event — a join carries no measurement"
+
+status_metrics="$(farm_psql "SELECT string_agg(DISTINCT metric, ',' ORDER BY metric)
+  FROM telemetry.reading WHERE device_id = '${status_device}'")"
+[ "$status_metrics" = "batteryPercent,linkMargin" ] \
+  || fail "a status report minted metrics \"${status_metrics}\", wanted batteryPercent,linkMargin"
+
+echo "[farm-e2e] a join and a status report landed as lifecycle rows, with their details intact"
+
+# And the gate on that second reading, which is the part a fixture is the only
+# way to reach: ChirpStack sends batteryLevel 0 both for a device on mains power
+# and for one that could not report, so storing it ungated would mint a false
+# 0% for a device that has no battery at all. A mains-powered status report must
+# therefore mint `linkMargin` and nothing else.
+MAINS_EUI="fe00000000000008"
+MAINS_EVENT_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
+publish_app_event "application/00000000-0000-4000-8000-00000000e2e1/device/${MAINS_EUI}/event/status" \
+  "{\"deduplicationId\":\"${MAINS_EVENT_ID}\",\"time\":\"$(node -e 'process.stdout.write(new Date().toISOString())')\",\"deviceInfo\":{\"devEui\":\"${MAINS_EUI}\",\"deviceName\":\"farm-e2e-mains\"},\"margin\":11,\"externalPowerSource\":true,\"batteryLevelUnavailable\":false,\"batteryLevel\":0}"
+
+wait_for "the mains-powered status report landed" \
+  "SELECT count(*) FROM telemetry.device_event WHERE source_event_id = '${MAINS_EVENT_ID}'" "-ge 1" 60
+
+mains_device="$(device_id_of "$MAINS_EUI")"
+[ -n "$mains_device" ] || fail "the mains-powered status report minted no device"
+mains_metrics="$(farm_psql "SELECT string_agg(DISTINCT metric, ',' ORDER BY metric)
+  FROM telemetry.reading WHERE device_id = '${mains_device}'")"
+[ "$mains_metrics" = "linkMargin" ] \
+  || fail "a mains-powered status report minted \"${mains_metrics}\", wanted linkMargin alone — a 0% battery must not be stored for a device that has no battery"
+echo "[farm-e2e] a mains-powered status report minted linkMargin alone — no false 0% battery"
+
+# The dedupe contract. Same deduplicationId, same event time, so the same
+# primary key: the second delivery must be recognized and add nothing.
+publish_app_event "$join_topic" "$join_payload"
+publish_app_event "$status_topic" "$status_payload"
+# The bridge is serial, so a third message processed after these two proves
+# both have been decided about. Reuse the placement fixture's device rather
+# than minting another: a fresh capture is the observable.
+LIFECYCLE_FENCE_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
+publish_app_event "$PLACEMENT_TOPIC" \
+  "{\"deduplicationId\":\"${LIFECYCLE_FENCE_ID}\",\"time\":\"$(node -e 'process.stdout.write(new Date().toISOString())')\",\"deviceInfo\":{\"devEui\":\"${PLACEMENT_EUI}\",\"deviceName\":\"farm-e2e-placement\"},\"fPort\":1,\"fCnt\":3,\"object\":{\"battery\":3.9}}"
+wait_for "the redeliveries were processed" \
+  "SELECT count(*) FROM telemetry.ingest_event WHERE source_event_id = '${LIFECYCLE_FENCE_ID}'" "-ge 1" 60
+
+lifecycle_rows="$(farm_psql "SELECT count(*) FROM telemetry.device_event WHERE device_id IN ('${join_device}', '${status_device}')")"
+[ "$lifecycle_rows" = "2" ] \
+  || fail "after redelivering both events the lifecycle table holds ${lifecycle_rows} row(s), wanted 2 — the conflict key is not deduping"
+echo "[farm-e2e] both events redelivered and neither duplicated — the lifecycle key dedupes"
+
 step "stopping the mock fleet"
 docker compose --profile mock stop mock-sensors
 sleep 5
@@ -1771,6 +2047,195 @@ archived_ids_after="$(archived_uplink_ids)"
 archived_after="$(id_count "$archived_ids_after")"
 wait_for_capture_of "uplinks captured once everything settled (archive holds ${archived_after})" \
   "$archived_ids_after" 180
+
+# ── cross-table invariants, over everything the run produced ──────────────────
+#
+# Every assertion up to here has been about a fixture, a device, or a set of
+# uplink ids. These four are about the database as a whole, and they are here --
+# after the nine failures, after the bad data, with the fleet stopped and the
+# bridge drained -- because that is the only point in the run where nothing is
+# racing and there is a full run's worth of rows to be wrong about.
+#
+# Cheap, too: four queries against tables that already carry the indexes for
+# them. What they catch is the class of bug no single-table assertion can, and
+# that the resilience steps' races are exactly where it would arise.
+
+step "asserting the cross-table invariants"
+
+# 1. The newest-value mirror against the fact table it mirrors. It is
+#    writer-managed, advanced only by `EXCLUDED.measured_at >
+#    reading_latest.measured_at`, and fed a batch de-duplicated per key -- so
+#    it must equal the true maximum for every key, and hold that row's value.
+#    A row in one table and not the other is drift too, hence the full join.
+latest_drift="$(farm_psql "WITH truth AS (
+    SELECT device_id, metric, channel, max(measured_at) AS newest
+      FROM telemetry.reading GROUP BY 1, 2, 3
+  )
+  SELECT count(*) FROM truth t
+    FULL JOIN telemetry.reading_latest l
+      ON l.device_id = t.device_id AND l.metric = t.metric AND l.channel = t.channel
+   WHERE t.device_id IS NULL OR l.device_id IS NULL OR l.measured_at <> t.newest")"
+[ "$latest_drift" = "0" ] \
+  || fail "reading_latest disagrees with telemetry.reading on ${latest_drift} key(s) — the mirror drifted from the newest measurement it claims to hold"
+
+# The timestamp agreeing is not the value agreeing: an intra-batch collision on
+# one instant is resolved by the fact table keeping the first arrival, and the
+# mirror has to keep the same one or it publishes a value no reading row holds.
+latest_value_drift="$(farm_psql "SELECT count(*) FROM telemetry.reading_latest l
+    JOIN telemetry.reading r
+      ON r.device_id = l.device_id AND r.metric = l.metric
+     AND r.channel = l.channel AND r.measured_at = l.measured_at
+   WHERE l.value_num IS DISTINCT FROM r.value_num
+      OR l.value_text IS DISTINCT FROM r.value_text
+      OR l.value_bool IS DISTINCT FROM r.value_bool")"
+[ "$latest_value_drift" = "0" ] \
+  || fail "reading_latest holds a value telemetry.reading does not, on ${latest_value_drift} key(s)"
+echo "[farm-e2e] reading_latest is exactly the newest reading for every key, value included"
+
+# 2. As-of stamping, over every reading in the run rather than one fixture.
+#    This is the claim the whole telemetry design rests on, and until this run
+#    seeded a second property it was unfalsifiable here.
+stamp_mismatch="$(farm_psql "SELECT count(*) FROM telemetry.reading r
+    JOIN registry.device_assignment a
+      ON a.device_id = r.device_id AND a.valid_range @> r.measured_at
+   WHERE r.property_id <> a.property_id")"
+[ "$stamp_mismatch" = "0" ] \
+  || fail "${stamp_mismatch} reading(s) are stamped with a property their placement window does not name — as-of stamping is wrong"
+
+stamp_covered="$(farm_psql "SELECT count(*) FROM telemetry.reading r
+    JOIN registry.device_assignment a
+      ON a.device_id = r.device_id AND a.valid_range @> r.measured_at")"
+[ "$stamp_covered" -gt 0 ] \
+  || fail "no reading is covered by any placement window, so the check above passed over nothing"
+
+# The rows a window does not cover are not a failure, and there are two honest
+# reasons for one -- measured rather than assumed, because the second is much
+# larger than it looks. A device's first uplink is measured a moment *before*
+# the window auto-registration opens for it, so it takes the writer's
+# documented fallback: that is the millisecond case. And a codec may supply its
+# own measurement `time`, which the writer honors anywhere inside the
+# three-year backfill bound -- so a datalogger reading can predate the device's
+# registration by months. This fleet has one: the GPS tracker's vectors carry a
+# fixed `time` about seventy days back, and every reading it produces lands in
+# this bucket. Both are the fallback working as designed.
+#
+# What would be a failure is an uncovered reading measured *after* its device's
+# history began -- that is a gap in the history, and a gap means the fallback
+# answered for a measurement some window should have owned. Asserted zero
+# below, and confirmed non-vacuous: pushing the baseline back an hour makes it
+# name 165 of the benign rows instead.
+stamp_unexplained="$(farm_psql "SELECT count(*) FROM telemetry.reading r
+   WHERE NOT EXISTS (SELECT 1 FROM registry.device_assignment a
+                      WHERE a.device_id = r.device_id AND a.valid_range @> r.measured_at)
+     AND r.measured_at >= (SELECT min(lower(a2.valid_range))
+                             FROM registry.device_assignment a2
+                            WHERE a2.device_id = r.device_id)")"
+[ "$stamp_unexplained" = "0" ] \
+  || fail "${stamp_unexplained} reading(s) fall inside their device's placement history but in no window — the history has a gap"
+echo "[farm-e2e] all ${stamp_covered} window-covered readings agree with the property valid when they were measured"
+
+# 3. The moved device's split, asserted now that the whole run's traffic has
+#    accumulated either side of the move. This is the half of the placement
+#    step that was deliberately left until everything had settled.
+pre_move_wrong="$(farm_psql "SELECT count(*) FROM telemetry.reading
+   WHERE device_id = '${moved_device}' AND measured_at < '${move_at}'::timestamptz
+     AND property_id <> '${default_property}'")"
+[ "$pre_move_wrong" = "0" ] \
+  || fail "${pre_move_wrong} reading(s) measured before the move were re-stamped off ${default_property} — a move must not rewrite history"
+
+post_move_wrong="$(farm_psql "SELECT count(*) FROM telemetry.reading
+   WHERE device_id = '${moved_device}' AND measured_at >= '${move_at}'::timestamptz
+     AND property_id <> '${south_property}'")"
+[ "$post_move_wrong" = "0" ] \
+  || fail "${post_move_wrong} reading(s) measured after the move are not stamped ${south_property}"
+
+post_move_count="$(farm_psql "SELECT count(*) FROM telemetry.reading
+   WHERE device_id = '${moved_device}' AND measured_at >= '${move_at}'::timestamptz")"
+[ "$post_move_count" -gt 0 ] \
+  || fail "the moved device reported nothing after the move, so the split above proves only half of itself"
+echo "[farm-e2e] the moved device: ${pre_move_readings}+ reading(s) still on ${default_property}, ${post_move_count} on ${south_property}"
+
+# 4. The lifecycle table. Asserted by device rather than by a global count:
+#    this bench's fleet is ABP and requests no status, so the only rows here
+#    are the fixtures -- but an OTAA fleet or a status interval would add
+#    real ones, and that should not turn this red.
+lifecycle_final="$(farm_psql "SELECT count(*) FROM telemetry.device_event
+   WHERE device_id IN ('${join_device}', '${status_device}', '${mains_device}')")"
+[ "$lifecycle_final" = "3" ] \
+  || fail "the lifecycle fixtures left ${lifecycle_final} row(s) in telemetry.device_event, wanted 3"
+lifecycle_total="$(farm_psql "SELECT count(*) FROM telemetry.device_event")"
+echo "[farm-e2e] telemetry.device_event holds ${lifecycle_total} row(s), including both lifecycle fixtures"
+
+# ── the security posture the bench actually depends on ────────────────────────
+
+step "asserting the farm profile stays on loopback"
+
+# The farm profile's whole security model is the address it listens on. The
+# curation API writes, serves no authentication and no TLS, and refuses an
+# `Origin` header — which stops a browser page, not a host on the LAN. The
+# GraphQL layer exposes every reading with GraphiQL on. Both are safe here only
+# because they are bound to 127.0.0.1, so a compose edit that dropped the bind
+# prefix would silently publish an unauthenticated write API to the network,
+# and nothing in this run would have noticed.
+#
+# Read from the running container rather than from docker-compose.yml, so an
+# override in `.env` is caught as readily as an edit to the file. Scoped to the
+# farm profile on purpose: mosquitto, ChirpStack, its REST gateway, both gateway
+# bridges and Leftenant are published unbound *deliberately* — they are the
+# LAN-facing half of this bench, and a blanket sweep would fail on them.
+# farmdata-migrate publishes nothing and so has nothing to check.
+#
+# Two guards before the bind itself, and the second was found the hard way: a
+# **paused** container reports an empty port map. `docker inspect` answers
+# `null` for `.NetworkSettings.Ports` while a container is frozen, so a service
+# left paused reads as publishing nothing at all — which this check would have
+# reported as clean. That is a false *pass* on a security assertion, the one
+# direction it must never fail in. Each of these three services publishes at
+# least one port by definition, so an empty map means "could not see" rather
+# than "nothing exposed", and is failed as such. (Failures 8 and 9 both thaw
+# their peer, and the EXIT trap thaws unconditionally, so reaching here paused
+# would itself be the bug.)
+for service in farm-postgres telemetry-bridge farmdata-api; do
+  cid="$(service_container "$service")"
+  [ -n "$cid" ] || fail "no container for ${service}, so its published ports cannot be checked"
+
+  paused="$(docker inspect --format '{{.State.Paused}}' "$cid")"
+  [ "$paused" = "false" ] \
+    || fail "${service} is paused (${paused}), and a paused container reports no port bindings — this check cannot see its binds"
+  running="$(docker inspect --format '{{.State.Running}}' "$cid")"
+  [ "$running" = "true" ] \
+    || fail "${service} is not running (${running}), so its published ports cannot be read"
+
+  published="$(docker inspect --format '{{json .NetworkSettings.Ports}}' "$cid" | node -e '
+    let s = "";
+    process.stdin.on("data", (d) => (s += d)).on("end", () => {
+      const ports = JSON.parse(s) || {};
+      let n = 0;
+      for (const binds of Object.values(ports)) n += (binds || []).length;
+      process.stdout.write(String(n));
+    });
+  ')"
+  [ "$published" -gt 0 ] \
+    || fail "${service} reports no published port at all — every farm service publishes one, so this is a blind check rather than a passing one"
+
+  offending="$(docker inspect --format '{{json .NetworkSettings.Ports}}' "$cid" | node -e '
+    let s = "";
+    process.stdin.on("data", (d) => (s += d)).on("end", () => {
+      const ports = JSON.parse(s) || {};
+      const bad = [];
+      for (const [port, binds] of Object.entries(ports)) {
+        // An exposed-but-unpublished port maps to null, which is not a bind.
+        for (const bind of binds || []) {
+          if (bind.HostIp !== "127.0.0.1") bad.push(`${port} -> ${bind.HostIp}:${bind.HostPort}`);
+        }
+      }
+      process.stdout.write(bad.join(", "));
+    });
+  ')"
+  [ -z "$offending" ] \
+    || fail "${service} publishes a port off loopback (${offending}) — the farm profile has no authentication and no TLS, so this exposes it to the network"
+  echo "[farm-e2e] ${service}: all ${published} published binding(s) are on 127.0.0.1"
+done
 
 # ── both read APIs still answer, and the two stores stay independent ──────────
 
@@ -1810,6 +2275,12 @@ farm_psql "SELECT 'devices          ' || count(*) FROM registry.device"
 farm_psql "SELECT 'readings         ' || count(*) FROM telemetry.reading"
 farm_psql "SELECT 'metrics seen     ' || count(DISTINCT metric) FROM telemetry.reading"
 farm_psql "SELECT 'uplinks captured ' || count(*) FROM telemetry.ingest_event WHERE event_type = 'up'"
+farm_psql "SELECT 'lifecycle events ' || count(*) FROM telemetry.device_event"
 farm_psql "SELECT 'curated devices  ' || count(*) FROM registry.device_assignment a WHERE upper_inf(a.valid_range) AND a.assigned_by NOT IN ('auto-register', 'inventory-reconcile')"
+# Per property, not just a total: with two seeded and a device moved between
+# them, a single number would hide the whole point of the placement steps.
+farm_psql "SELECT 'readings on      ' || p.name || ': ' || count(*)
+             FROM telemetry.reading r JOIN registry.property p USING (property_id)
+            GROUP BY p.name ORDER BY p.name"
 echo "[farm-e2e] ================================================"
 echo "[farm-e2e] PASS"
