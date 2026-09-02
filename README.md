@@ -296,10 +296,11 @@ where to look: `docker compose logs farmdata-migrate`.
 `scripts/farm-e2e.sh` boots the farm profile with the mock fleet and walks the whole path: uplinks
 land as normalized, property-stamped readings, every metric resolves in the dictionary, the store
 answers GraphQL, a device is curated through the curation API, and the curation-lag alarm is
-asserted by its exit code. It then puts the path under the seven failures it has to survive — the
+asserted by its exit code. It then puts the path under the nine failures it has to survive — the
 database stopped underneath it, the bridge stopped while the broker keeps receiving, the bridge
 killed outright, then the broker itself restarted under a live bridge, restarted with a backlog
-queued, and killed outright, and finally the whole box power-cycled at once — and checks that
+queued, and killed outright, then the whole box power-cycled at once, and finally the database and
+the broker each *frozen* rather than stopped — and checks that
 ingestion resumes each time with nothing left behind. Each
 recovery is asserted per message rather than by count: the uplink ids
 ChirpStack's archive held at the moment the failure ended all have to reach `farmdata`, and since
@@ -382,6 +383,56 @@ fleet is stopped and allowed to settle before the plug is pulled. What makes the
 anything with the fleet quiet is the backlog: the bridge is stopped for a few uplink rounds first, so
 the ids being waited for are genuinely still in the broker rather than already in `farmdata`.
 
+**The eighth and ninth failures are a different shape from the seven before them, and that is the
+point of adding them.** A stop, a kill and a restart are all _polite_: the socket closes, so the
+peer's departure arrives as an error and every waiter is woken by something the kernel said out
+loud. `docker compose pause` sends SIGSTOP, which closes nothing — established connections stay
+established, the kernel keeps completing handshakes on the stopped process's behalf, and nothing
+ever answers. Every wait on such a peer is unbounded unless the waiter brought its own bound, and a
+bridge sitting inside one looks exactly like a bridge with nothing to do.
+
+So those two steps assert that the wedge is **visible** — a bounded-deadline line in the log, a
+rising `writeRetries` in the bridge's own counter report — rather than that nothing was lost, which
+while a peer is frozen is not a claim anyone can make: nothing is acknowledged, so nothing can be.
+The counter matters more than it looks, because the expectation _inverts_ between the two database
+failures. Across the clean stop/start of failure 1, `writeRetries` is legitimately 0: the socket
+error reaches the writer session's reconnect loop first, and the consumer only ever sees one slow
+write. Under a freeze it cannot be 0, because there is no socket error for that loop to absorb.
+
+**The `farmdata-api` check after failure 8 asserts less than it looks like it does**, which is worth
+stating rather than letting a green step imply the stronger thing. The read API is *idle* for the
+whole freeze — nothing in the step queries it — so its pool has no statement in flight, and an idle
+pooled connection going quiet costs nothing: the first query after the thaw answered in 29 ms with
+`RestartCount` still 0, so it never died and `restart: unless-stopped` never fired. That a freeze
+the read API slept through leaves it working is worth knowing, and it is not the same as recovering
+from a wedge. Testing the wedge means holding a query open across the freeze; PostGraphile's pool
+has no Node-side statement bound, so the honest expectation is that it hangs, and the fix would be a
+`query_timeout` in `farm-api/server.js` rather than another assertion. Unlike the bridge, nothing is
+lost either way — a stateless reader that restarts is a liveness question, not an ingest one.
+
+Failure 9 quiesces the fleet first for exactly the `join_all` reason failure 7 does. What ends the
+silence there is MQTT keepalive and nothing else, so the step reads the interval out of the bridge
+image rather than carrying a copy and scales its own patience to it — and it has to prove the bridge
+is _connected and subscribed_ before freezing the broker, because a bridge caught mid-reconnect
+would be bounded by mqtt.js's `connectTimeout` instead, which is a different mechanism and a weaker
+claim. `wait_for_broker` does not show that; it says the broker answers a probe of the script's own.
+
+**Failure 9 deliberately makes no backlog claim, and the first draft did.** The bridge drains a few
+hundred messages a second, so a backlog queued before the freeze is already in `farmdata` by the
+time the pause lands — and with the fleet quiesced, a set frozen from the archive is satisfied
+before the freeze even begins. It would have passed without the broker being touched. The "session
+survived" claim needs the CONNACK's session-present flag, which is invisible from out here; the
+bridge repo's own proof owns it. What this step asserts instead is ingest resuming end to end: the
+fleet restarts, a _new_ uplink has to reach the archive, and only then does every id the archive
+holds have to reach `farmdata` — a set that now contains uplinks which did not exist before the
+freeze.
+
+One practical note if you write another of these: nothing can read `farmdata` while `farm-postgres`
+is paused. `farm_psql` and `wait_for_broker` are `docker compose exec`, and the daemon refuses that
+against a paused container outright — immediately, not by hanging. The bridge's experience of the
+same container is the opposite, and the asymmetry is the whole subject: it holds a TCP connection
+SIGSTOP never closed, so its statement goes quiet with no error at all.
+
 The database-outage step re-asserts `farmdata-api` itself as well, not only the store behind it.
 Every other check after a failure reads `farmdata` through `psql`, so a read API left dead by a
 database blip would pass the rest of the run — and unlike the bridge, it has no retry loop of its
@@ -428,9 +479,11 @@ bash scripts/farm-e2e.sh              # tears the stack down afterwards
 FARM_E2E_KEEP=1 bash scripts/farm-e2e.sh   # leave it running (fast iteration)
 ```
 
-It takes around twenty minutes, most of it waiting on uplink rounds, on containers
-stopping and starting, on the one checkpoint interval the killed-broker step sits through, and on
-the offline backlog the poison step has to build before it has anything to drain. Counts are asserted
+It takes around twenty-five minutes, most of it waiting on uplink rounds, on containers
+stopping and starting, on the one checkpoint interval the killed-broker step sits through, on the
+bridge's own 30s write deadline expiring under the frozen database, and on
+the offline backlogs the poison and broker-freeze steps have to build before they have anything to
+drain. Counts are asserted
 as floors, never as exact fleet totals: `mock-sensors` sends one unacknowledged UDP datagram per
 uplink with no retransmit, so an occasional frame never reaches ChirpStack at all, and that is a
 transport flake rather than a bridge regression. What proves nothing was lost is the comparison

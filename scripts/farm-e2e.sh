@@ -6,9 +6,22 @@
 # ChirpStack and mosquitto into the telemetry bridge, landing as normalized,
 # property-stamped readings in farmdata, queryable over GraphQL, with a device
 # curated through the curation API and the curation-lag alarm asserted by its
-# exit code. Then the same path put under seven failures it has to survive --
+# exit code. Then the same path put under nine failures it has to survive --
 # three in the consumer and its database, three in the broker holding the queue
-# that the first three depend on, and one that breaks everything at once.
+# that the first three depend on, one that breaks everything at once, and two
+# where a peer stops answering without going away.
+#
+# Those last two are a different shape from the seven before them, and the
+# distinction is the point. A stop, a kill and a restart are all *polite*: the
+# socket closes, so the peer's departure arrives as an error and every waiter is
+# woken by something the kernel said out loud. `docker compose pause` sends
+# SIGSTOP, which closes nothing -- established connections stay established, the
+# kernel keeps completing handshakes on the stopped process's behalf, and
+# nothing ever answers. Every wait on such a peer is unbounded unless the waiter
+# brought its own bound, and a bridge sitting inside one looks exactly like a
+# bridge with nothing to do. So those two steps assert that the wedge is
+# *visible* -- named in the log, counted in the report -- rather than that
+# nothing was lost, which while a peer is frozen is not a claim anyone can make.
 #
 # Then bad data, which is the other half of what a farm sends: a poison message
 # in the middle of an offline backlog (the one that matters -- an unacked poison
@@ -47,6 +60,23 @@
 # the failure ended, every one of which has to reach farmdata. Fresh uplinks
 # are not in that set and so cannot satisfy it. Do not reduce those back to a
 # comparison of counts, in either direction.
+#
+# One consequence of a frozen peer worth stating before the steps: nothing here
+# can read farmdata while farm-postgres is paused. `farm_psql`, `events_psql`
+# and `wait_for_broker` are all `docker compose exec`, and the daemon refuses
+# that outright against a paused container -- "is paused, unpause the container
+# before exec", exit 1, immediately. So a `wait_for` during a freeze is not a
+# hang; it is a poll that can never succeed, failing at its own timeout with an
+# empty last value.
+#
+# Worth being exact about, because the *bridge's* experience of the same
+# container is the opposite, and that asymmetry is the whole point of these two
+# steps. It holds a TCP connection to Postgres, which SIGSTOP does not close, so
+# its statement hangs with no error at all. Docker refusing an exec is a
+# control-plane answer about the container; the silence is what a data-plane
+# client meets. Both pause steps therefore take what they need from farmdata
+# before the freeze or after the thaw, and assert during it from host-side
+# surfaces only: `docker compose logs`, `bridge_report`, `docker inspect`.
 #
 # The three broker failures need one more thing said about them. Nothing is
 # published *through* a broker that is down: the gateway bridges reach ChirpStack
@@ -304,6 +334,41 @@ oneshot_state() {
   docker inspect "$cid" --format '{{.State.StartedAt}} {{.State.Status}} {{.State.ExitCode}}'
 }
 
+# Whether a service's container is frozen. `docker inspect` reads the daemon's
+# own record, which is the only place this shows: a paused container reports
+# `Up` to `docker ps` and its last known health status forever after, since the
+# healthcheck exec cannot run inside it either.
+#
+# Asserted rather than assumed by the pause steps below, because a `pause` that
+# silently did nothing would leave them proving the happy path at length.
+service_paused() {
+  local cid
+  cid="$(service_container "$1")"
+  [ -n "$cid" ] || fail "service $1 has no container to inspect"
+  docker inspect "$cid" --format '{{.State.Paused}}'
+}
+
+# The MQTT keepalive the bridge connects with, read out of the image rather
+# than written down here.
+#
+# Same rule as broker_autosave_seconds below: it is the bound the step's own
+# assertion is scaled to, and a copy kept in this script would keep passing
+# after someone changed the real one. The bridge exports it for exactly this,
+# so this asks the running image what it is -- `--no-deps` and `--entrypoint`
+# so it needs nothing else up, which matters because this runs while the
+# broker is about to be frozen.
+#
+# Compose writes its own progress to stderr, so stdout is just the number.
+bridge_keepalive_seconds() {
+  local seconds
+  seconds="$(docker compose run --rm --no-deps -T --entrypoint node telemetry-bridge \
+    -e 'process.stdout.write(String(require("/app/dist/index.js").DEFAULT_MQTT_KEEPALIVE_SECONDS ?? ""))' \
+    2>/dev/null | tr -d '[:space:]')"
+  [ -n "$seconds" ] \
+    || fail "the bridge image exports no DEFAULT_MQTT_KEEPALIVE_SECONDS, so mqtt.js's own default applies and how long a frozen broker goes unnoticed is a library default rather than a number this step can scale to"
+  printf '%s' "$seconds"
+}
+
 broker_autosave_seconds() {
   local seconds
   seconds="$(awk '/^autosave_interval[[:space:]]+[0-9]+[[:space:]]*$/ { print $2 }' mosquitto/mosquitto.conf)"
@@ -465,6 +530,16 @@ publish_app_event() {
 started=0
 cleanup() {
   local code=$?
+  # Unconditional, ahead of everything else, and it runs even under
+  # FARM_E2E_KEEP. A run that died inside one of the pause steps below leaves a
+  # container that reads as `Up` to anything not looking at `{{.State.Paused}}`,
+  # answers no client, and refuses every `docker compose exec` -- so the next
+  # run fails on its first `farm_psql` for a reason with nothing to do with what
+  # it was testing. Cheap to undo here, confusing to diagnose later.
+  #
+  # `unpause` on a container that is not paused is an error rather than a state
+  # change, so its output and status are both discarded.
+  docker compose --profile farm unpause farm-postgres mosquitto >/dev/null 2>&1 || true
   if [ "$started" = "1" ] && [ "${FARM_E2E_KEEP:-0}" != "1" ]; then
     echo ""
     echo "[farm-e2e] tearing down (set FARM_E2E_KEEP=1 to keep the stack running)"
@@ -1157,9 +1232,267 @@ dupes="$(farm_psql "SELECT count(*) FROM (SELECT device_id, metric, channel, mea
 [ "$dupes" = "0" ] || fail "$dupes reading key(s) appear more than once -- telemetry.reading's primary key is no longer enforcing idempotency"
 echo "[farm-e2e] no reading key appears twice — idempotency survived the cycle"
 
+# ── failures 8 and 9: a peer stops answering without going away ──────────────
+#
+# The seven above are all *polite*. A stop, a kill and a restart close the
+# socket, so the peer's departure arrives as an error and every waiter is woken
+# by something the kernel said out loud. These two send SIGSTOP instead, which
+# closes nothing: established connections stay established, the kernel keeps
+# completing handshakes on the stopped process's behalf, and nothing ever
+# answers. Every wait on such a peer is unbounded unless the waiter brought its
+# own bound, and a bridge sitting inside one is indistinguishable from a bridge
+# with nothing to do.
+#
+# They come last because they are the only steps here that cannot use
+# `farm_psql` or `wait_for_broker` while the failure is in effect -- the Docker
+# daemon refuses an exec against a paused container -- so they read from
+# `docker compose logs`, `bridge_report` and `docker inspect` instead, and take
+# what they need from farmdata before the freeze or after the thaw. Running them
+# after everything else keeps that constraint out of the other seven.
+
+step "FAILURE 8 -- the database freezes rather than stopping"
+
+# Failure 1 stopped it. This freezes it, and the difference is the whole step.
+#
+# A stopped Postgres closes every socket, so the bridge's write fails with an
+# error it already retries and the writer session's reconnect loop is woken by
+# something the kernel said out loud. A frozen one -- SIGSTOP, which is what
+# `docker compose pause` sends -- closes nothing: the connection stays
+# established, the statement never returns, and there is no socket event for
+# either loop to see. Nothing in `pg` covers that (connectionTimeoutMillis is
+# for the connect and was consulted long ago) and a server-side
+# statement_timeout cannot either, because a server that has stopped executing
+# cannot enforce its own timeouts.
+#
+# So what this asserts is not that nothing is lost -- nothing is acked while
+# the peer is frozen, so nothing can be -- but that the wedge is *visible*.
+# A bridge sitting inside an unbounded write and a bridge with nothing to do
+# look identical from out here, and only one of them is a farm still working.
+#
+# Safe to run mid-fleet, unlike the broker freeze further down: a frozen
+# farmdata stalls nothing upstream. ChirpStack keeps receiving, the broker
+# keeps queuing for the bridge's persistent session, and both stores stay in
+# step.
+docker compose --profile mock up -d mock-sensors
+sleep "$MOCK_INTERVAL_SECONDS"
+
+log_mark="$(docker compose logs --no-color telemetry-bridge | wc -l | tr -d ' ')"
+freeze_before="$(bridge_report "before the database freeze")"
+
+# Frozen while the archive set is still readable. events-postgres is a
+# different container and stays up throughout, but farmdata's own reads do not
+# -- so everything this step needs from farm-postgres is taken before the
+# freeze or after the thaw, never during.
+required_ids="$(archived_uplink_ids)"
+
+docker compose pause farm-postgres
+# The injection itself, which no other step here has to prove: a `pause` that
+# silently did nothing would leave everything below asserting the happy path at
+# length. `{{.State.Paused}}` rather than anything else, because the obvious
+# observables lie in both directions -- `docker ps` reads `Up N (Paused)`, and
+# health flips to `unhealthy` within a second with `FailingStreak` still 0 (so
+# Docker marks it on the pause itself, not through the retry counter) and stays
+# there until the first successful check *after* the thaw.
+[ "$(service_paused farm-postgres)" = "true" ] \
+  || fail "farm-postgres is not paused -- this step proved nothing"
+echo "[farm-e2e] farmdata is frozen: sockets open, nothing answering"
+
+# Polled rather than slept through, and the arithmetic is why. The deadline
+# under test is the daemon's own 30s write bound, but it does not start when
+# this step does -- it starts at the next uplink the bridge tries to write, up
+# to one MOCK_INTERVAL later. A fixed sleep would therefore have to be
+# 30 + interval + slack, and a fixed sleep of 40s would pass or fail depending
+# on where in the fleet's cycle the freeze landed. So: poll, with a budget that
+# names both terms.
+#
+# One specific pattern, not failure 1's union of three. That step matches
+# either loop because a stopped server's socket error races the next write and
+# both answers are correct. There is no race here and no union: a frozen server
+# sends nothing, so the session's reconnect loop has nothing to be woken by and
+# the only thing that can end the wait is the write bound itself.
+#
+# Read into a variable and matched with a here-string, for the reason failure 1
+# records: `grep -q` exits at its first match, `docker compose logs` is still
+# writing, takes EPIPE and exits 255, and pipefail returns *that*.
+wedge_deadline=$(( $(date +%s) + 30 + MOCK_INTERVAL_SECONDS + 30 ))
+while :; do
+  freeze_log="$(docker compose logs --no-color telemetry-bridge | tail -n "+$((log_mark + 1))")"
+  if grep -qE 'write failed .*abandoned' <<<"$freeze_log"; then
+    echo "[farm-e2e] the bridge reported the wedge rather than sitting in it"
+    break
+  fi
+  [ "$(date +%s)" -lt "$wedge_deadline" ] \
+    || fail "the bridge logged no abandoned write in $(( 30 + MOCK_INTERVAL_SECONDS + 30 ))s with the database frozen -- it is sitting in an unbounded wait, and from out here that is indistinguishable from an idle farm"
+  sleep 3
+done
+
+# And the counter, which is what anything outside the process can read -- the
+# reason the ingest report exists. Worth noting this inverts failure 1's
+# expectation: across a clean stop/start writeRetries is legitimately 0,
+# because the session's reconnect absorbs the failure and the consumer only
+# ever sees one slow write. A frozen peer is the case where it cannot be 0.
+freeze_during="$(bridge_report "during the database freeze")"
+retries_before="$(report_field "$freeze_before" '.writeRetries')"
+retries_during="$(report_field "$freeze_during" '.writeRetries')"
+[ -n "$retries_before" ] && [ -n "$retries_during" ] \
+  || fail "the bridge's report carries no writeRetries -- was=\"$retries_before\" is=\"$retries_during\""
+[ "$retries_during" -gt "$retries_before" ] \
+  || fail "writeRetries did not move across the freeze (${retries_before} -> ${retries_during}) -- there is no socket error here, so nothing else can report the failure"
+echo "[farm-e2e] writeRetries ${retries_before} → ${retries_during} with the database frozen"
+
+docker compose unpause farm-postgres
+[ "$(service_paused farm-postgres)" = "false" ] \
+  || fail "farm-postgres did not thaw"
+
+wait_for_capture_of "uplinks captured after the database thawed (archive held $(id_count "$required_ids"))" \
+  "$required_ids" 180
+echo "[farm-e2e] the bridge resumed writing on its own — no restart needed"
+
+# farmdata-api shared the freeze, and this asserts less than it looks like it
+# does -- worth saying plainly, because the flattering reading is the wrong one.
+#
+# It is *idle* for the whole freeze: nothing above queries it, so its pool has
+# no statement in flight, and an idle pooled connection that goes quiet costs
+# nothing -- the next query after the thaw opens or reuses one and simply works
+# (measured: it answered in 29ms, with RestartCount still 0, so it never died
+# and `restart: unless-stopped` never fired). So what this proves is that a
+# freeze the read API slept through leaves it working, which is worth knowing
+# and is not the same as recovering from a wedge.
+#
+# Testing the wedge would mean holding a query open across the freeze and
+# asking whether the process survives it. Deliberately not here: PostGraphile's
+# pool has no Node-side statement bound, so the honest expectation is that it
+# would hang, and the fix is a `query_timeout` in `farm-api/server.js` rather
+# than another assertion. It is a liveness question about a stateless reader
+# that restarts, not about ingest -- unlike the bridge, nothing is lost either
+# way -- which is why it stays a note instead of a step.
+wait_for_farm_graphql "farmdata-api after the database freeze" 120
+
+
+# ── failure 9: the broker freezes rather than dying ───────────────────────────
+#
+# Failures 4, 5 and 6 stopped, restarted and killed the broker. Every one of
+# those closes the socket, so mqtt.js takes an error and its reconnect loop
+# starts because something told it to. This freezes the broker instead, and
+# nothing in either repo had ever done that: every silent-peer proof on this
+# path sits in front of a database.
+#
+# What has to end the silence is MQTT's own keepalive, and nothing else can.
+# There is no socket error, no FIN and no PUBACK -- and the reconnect attempts
+# that follow do not fail either, because the kernel completes the TCP
+# handshake on the stopped broker's behalf and the CONNACK simply never
+# arrives. The bridge sets keepalive explicitly for exactly this reason;
+# mqtt.js's own default is twice as long, and a number owned by a library is
+# not a bound anyone here chose.
+#
+# The fleet is stopped and allowed to settle first, and that is the same
+# load-bearing precondition failure 7 has, for the same reason. ChirpStack
+# dispatches its integrations under futures::future::join_all, so the MQTT
+# publish and the PostgreSQL archive race each other -- and a publish that
+# never completes because the broker stopped answering is logged rather than
+# retried. An uplink can therefore land in the archive with its publish never
+# having happened: an id farmdata will never receive, which reddens the
+# end-of-run comparison on this run and every later run against a kept bench.
+# Nothing downstream can repair that; the two integrations are not
+# transactional with each other.
+step "FAILURE 9 -- the broker freezes, sockets open and nothing answering"
+
+docker compose --profile mock stop mock-sensors
+sleep "$MOCK_INTERVAL_SECONDS"
+
+# The bridge has to be *connected and subscribed* when the broker freezes, and
+# proving that is the whole setup. The failure lives on an established
+# connection: a client that already believes it is subscribed, waiting on a peer
+# that has stopped answering, where keepalive is the only thing that can end the
+# wait. A bridge that happened to be mid-reconnect would instead be bounded by
+# mqtt.js's connectTimeout, which is a different mechanism and a weaker claim.
+#
+# `wait_for_broker` is not that proof -- it says the broker answers a probe of
+# this script's own, not that the bridge is attached to it. So this waits for
+# the bridge's own connect line.
+log_mark="$(docker compose logs --no-color telemetry-bridge | wc -l | tr -d ' ')"
+docker compose restart telemetry-bridge
+wait_for_broker "before freezing the broker" 60
+connect_deadline=$(( $(date +%s) + 90 ))
+while :; do
+  connect_log="$(docker compose logs --no-color telemetry-bridge | tail -n "+$((log_mark + 1))")"
+  if grep -qE 'connected to mqtt' <<<"$connect_log"; then
+    echo "[farm-e2e] the bridge is connected and subscribed"
+    break
+  fi
+  [ "$(date +%s)" -lt "$connect_deadline" ] \
+    || fail "the bridge never reported connecting to the broker, so freezing it now would test a reconnect rather than an established connection"
+  sleep 2
+done
+
+# Where the log stands with the bridge connected and quiet. Taken after the
+# connect so the notice assertion below cannot match this restart's own
+# reconnect chatter -- which would pass instantly and prove nothing.
+log_mark="$(docker compose logs --no-color telemetry-bridge | wc -l | tr -d ' ')"
+
+docker compose pause mosquitto
+[ "$(service_paused mosquitto)" = "true" ] \
+  || fail "mosquitto is not paused -- this step proved nothing"
+echo "[farm-e2e] the broker is frozen: accepting connections, answering none"
+
+# Bounded by the keepalive the bridge actually runs with, read out of the image
+# rather than guessed. mqtt.js pings on the interval and gives up when the next
+# one finds no PINGRESP, so twice the interval is the mechanism; four times is
+# the bound, generous on purpose, because a bar at exactly two would make this a
+# timing test rather than a recovery one.
+keepalive_seconds="$(bridge_keepalive_seconds)"
+notice_budget=$(( keepalive_seconds * 4 ))
+notice_deadline=$(( $(date +%s) + notice_budget ))
+while :; do
+  freeze_log="$(docker compose logs --no-color telemetry-bridge | tail -n "+$((log_mark + 1))")"
+  if grep -qE 'broker unreachable|reconnecting to the broker' <<<"$freeze_log"; then
+    echo "[farm-e2e] the bridge noticed the frozen broker — keepalive is what ended the wait"
+    break
+  fi
+  [ "$(date +%s)" -lt "$notice_deadline" ] \
+    || fail "the bridge said nothing in ${notice_budget}s with the broker frozen (keepalive ${keepalive_seconds}s) -- it is waiting on a peer that will never answer, and a farm gone quiet looks exactly like this"
+  sleep 2
+done
+
+docker compose unpause mosquitto
+[ "$(service_paused mosquitto)" = "false" ] \
+  || fail "mosquitto did not thaw"
+wait_for_broker "after thawing the broker" 60
+
+# Ingest resumed, end to end, which is the claim. Deliberately *not* a backlog
+# assertion: this bridge drains a few hundred messages a second, so a backlog
+# queued before the freeze is already in farmdata by the time the pause lands,
+# and a set frozen with the fleet quiet is satisfied before the freeze even
+# begins -- it would pass without the broker ever having been touched. The
+# "session survived" claim needs the CONNACK's session-present flag, which is
+# invisible from out here; the bridge repo's own proof 9 owns it.
+#
+# So: restart the fleet, wait for a *new* uplink to reach the archive (proving
+# the publish path re-formed through the thawed broker at all), and then require
+# every id the archive holds to reach farmdata. That set now contains uplinks
+# that did not exist before the freeze, so only a working path satisfies it.
+docker compose --profile mock up -d mock-sensors
+archived_before_recovery="$(id_count "$(archived_uplink_ids)")"
+growth_deadline=$(( $(date +%s) + MOCK_INTERVAL_SECONDS * 6 + 60 ))
+while :; do
+  archived_now="$(id_count "$(archived_uplink_ids)")"
+  if [ "$archived_now" -gt "$archived_before_recovery" ]; then
+    echo "[farm-e2e] the whole publish path recovered — the archive grew ${archived_before_recovery} → ${archived_now}"
+    break
+  fi
+  [ "$(date +%s)" -lt "$growth_deadline" ] \
+    || fail "no uplink reached the archive after the broker thawed (still ${archived_now}) -- the gateway bridge or ChirpStack never recovered its connection to it"
+  sleep 3
+done
+
+required_ids="$(archived_uplink_ids)"
+wait_for_capture_of "uplinks captured after the broker thawed (archive held $(id_count "$required_ids"))" \
+  "$required_ids" 180
+echo "[farm-e2e] the bridge is ingesting again through the thawed broker"
+
 # ── malformed data through the real pipe ─────────────────────────────────────
 #
-# The seven failures above each break a *component*. These break the *data*,
+# The nine failures above each break a *component*. These break the *data*,
 # which is the other half of what a farm sends and the half this bench has
 # never seen: the adapter's malformed shapes are covered in-process by the
 # telemetry-bridge repo's db:exercise:adapter, and nothing here ever put one
@@ -1415,12 +1748,12 @@ step "stopping the mock fleet"
 docker compose --profile mock stop mock-sensors
 sleep 5
 
-# ── nothing was lost across the seven failures, or the malformed data ────────
+# ── nothing was lost across the nine failures, or the malformed data ─────────
 
-step "asserting nothing was lost across the seven failures and the bad data"
+step "asserting nothing was lost across the nine failures and the bad data"
 
 # The captured-vs-archived comparison up top ran before any failure was injected.
-# This is that same assertion after all seven of them and after the malformed
+# This is that same assertion after all nine of them and after the malformed
 # data, and it is the one that holds regardless of which step a loss would be
 # attributable to: whatever ChirpStack received across the whole run, the bridge
 # has. The synthetic fixtures do not disturb it -- they are in farmdata and not
