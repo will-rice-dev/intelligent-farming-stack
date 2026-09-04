@@ -732,6 +732,51 @@ set -e
 [ "$lag_code" = "0" ] || fail "curation-lag should exit 0 once nothing is lagging, got $lag_code"
 echo "[farm-e2e] curation-lag exits 0 — the alarm is quiet again"
 
+# ── partition maintenance ─────────────────────────────────────────────────────
+#
+# The bench's share of the maintenance proof, which is deliberately the *happy*
+# half only. The bridge repo's db:exercise:maintenance plants the real failure --
+# a row past the newest child, in the kept default partition -- and watches the
+# verdict turn degraded and back; that cannot live here, because a default row
+# left behind makes the partition set permanently unmaintainable and would
+# redden every later run against a kept bench. Deterministic proof there, exact
+# invariant here: the same split the backdated placement correction takes.
+#
+# Three things are asserted, and the third is the one no exit code gives.
+set +e
+docker compose run --rm --no-deps -T telemetry-bridge maintain >/dev/null 2>&1
+maintain_code=$?
+set -e
+[ "$maintain_code" = "0" ] \
+  || fail "telemetry-bridge maintain should exit 0 against a healthy bench, got ${maintain_code} (2 = a partition set is degraded, 1 = the run could not happen)"
+echo "[farm-e2e] telemetry-bridge maintain exits 0 — every partition set is healthy"
+
+# The daemon's own scheduled run, read out of the ingest report rather than by
+# invoking anything: the subcommand above proves the code works, and this proves
+# the *running* bridge is actually the thing keeping the partitions current.
+# `scheduled` false here means the compose service is missing its maint login,
+# which is exactly the silent misconfiguration the report exists to surface.
+maintenance_report="$(bridge_report 'partition maintenance')"
+maintenance_scheduled="$(report_field "$maintenance_report" '.maintenance.scheduled')"
+maintenance_verdict="$(report_field "$maintenance_report" '.maintenance.lastVerdict')"
+[ "$maintenance_scheduled" = "true" ] \
+  || fail "the running bridge is not scheduling partition maintenance (maintenance.scheduled=${maintenance_scheduled}) -- check FARM_BRIDGE_MAINT_LOGIN_USER/_PASSWORD on the telemetry-bridge service"
+[ "$maintenance_verdict" = "healthy" ] \
+  || fail "the bridge's own startup maintenance run reported '${maintenance_verdict}', not healthy"
+echo "[farm-e2e] the running bridge scheduled maintenance and its own run reported healthy"
+
+# And the forward-looking check itself, asked of the database directly. This is
+# the one that would fail weeks before anything broke, and asking pg_partman the
+# same question the writer's next insert will ask is what makes it correct by
+# construction rather than by arithmetic over partition names.
+horizon_gaps="$(farm_psql "SELECT count(*) FROM partman.part_config pc WHERE NOT coalesce((partman.show_partition_name(pc.parent_table, (now() + interval '45 days')::text)).table_exists, false)")"
+[ "$horizon_gaps" = "0" ] \
+  || fail "${horizon_gaps} partition set(s) have no child covering traffic 45 days from now"
+default_rows="$(farm_psql "SELECT count(*) FROM partman.check_default(p_exact_count := false)")"
+[ "$default_rows" = "0" ] \
+  || fail "a default partition holds rows on this bench (${default_rows} set(s)) -- every fixture here is timestamped inside a real month, so this means one escaped"
+echo "[farm-e2e] a partition covers traffic 45 days out, and no default partition holds a row"
+
 # ── property stamping across a placement change ───────────────────────────────
 #
 # The design's marquee claim: a reading belongs to the property where it was

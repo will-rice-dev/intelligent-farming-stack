@@ -646,15 +646,45 @@ Leftenant reads.
 
 ### Partition maintenance
 
-`reading` and `ingest_event` are partitioned monthly with retention, and **nothing on this bench
-runs maintenance automatically** — the pg_partman background worker is preloaded but deliberately
-left unpointed, since aiming it at a database before the chain has installed pg_partman makes it
-fail every cycle. Premake covers the near term. To run it by hand:
+`reading` and `ingest_event` are partitioned monthly with retention, and **the bridge daemon
+maintains them**: one pass before it opens its broker connection, then every
+`FARM_BRIDGE_MAINTAIN_INTERVAL_SECONDS` (default a day). The startup pass is the load-bearing half —
+premake keeps three months of children ahead, so a box powered off for longer than that would
+otherwise write its first uplink into a default partition, and a default partition holding a row for
+some month is what makes a partition set permanently unmaintainable. The pg_partman background
+worker is still preloaded but stays unpointed, and is not the mechanism here.
+
+On demand, and for a monitor:
 
 ```sh
-docker compose exec farm-postgres psql -U farmdata_owner -d farmdata \
-  -c "SELECT partman.run_maintenance()"
+docker compose run --rm --no-deps telemetry-bridge maintain
+# 0 = every set healthy · 2 = a set is degraded · 1 = the run could not happen
 ```
+
+**The exit code is the verdict, and it has to be.** pg_partman answers a partition set it cannot
+maintain with `RAISE WARNING`, nulls that set's `maintenance_last_run`, and returns successfully —
+so nothing downstream of an exit status can see the one condition worth paging on. The run is
+followed by three catalog reads: that maintenance actually moved for every set, that a child already
+covers traffic 45 days out (the forward check, which fires with weeks of margin), and that no
+default partition holds a row past its newest child. The verdict also rides on the bridge's ingest
+report, under `maintenance`.
+
+The headroom check on its own, if you want to ask the database directly:
+
+```sh
+docker compose exec farm-postgres psql -U farmdata_owner -d farmdata -c \
+  "SELECT pc.parent_table,
+          (partman.show_partition_name(pc.parent_table,
+             (now() + interval '45 days')::text)).table_exists
+     FROM partman.part_config pc"
+```
+
+Maintenance connects as `FARM_BRIDGE_MAINT_LOGIN_USER`, a member of `partman_maintainer`, which
+**owns** both partition sets — `ATTACH PARTITION` and `DROP PARTITION` require owning the parent and
+no `GRANT` confers ownership. Leave that pair blank and the daemon still runs, says maintenance is
+unscheduled at startup, and repeats it in every ingest report. The full reasoning, and the runbook
+for a `degraded` answer, are in the telemetry-bridge repo's README under "Partitioning and
+retention".
 
 ## Region / sub-band
 
@@ -886,7 +916,7 @@ The `farm` profile adds three more, all off unless you name the profile:
 - **The curation API has no authentication and no TLS**, and it writes. It is published on loopback
   only for that reason; move that bind only behind both. It refuses any request carrying an `Origin`
   header, which is what keeps a browser page from reaching it, not a substitute for auth.
-- **`farmdata` ships placeholder passwords** for the owner and for both minted login users. The two
+- **`farmdata` ships placeholder passwords** for the owner and for all three minted login users. The
   services connect as least-privilege logins rather than the owner — the GraphQL layer holds
   `SELECT` and nothing else, which is what makes it read-only by role rather than by convention —
   but the passwords are still `changeme-*` until you rotate them.

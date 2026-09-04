@@ -328,10 +328,18 @@ services:
     # shared_preload_libraries costs a restart, so the worker is preloaded from
     # first boot even though it stays idle.
     #
-    # pg_partman_bgw.dbname is deliberately EMPTY. Pointing the background
-    # worker at a database before the migration chain has installed pg_partman
-    # makes it fail every cycle and log at ERROR. Set it only against a database
-    # farmdata-migrate has already migrated at least once.
+    # pg_partman_bgw.dbname is deliberately EMPTY, and the worker is not how
+    # maintenance runs here: the telemetry-bridge daemon schedules it (one pass
+    # before it opens its broker connection, then daily) and
+    # `telemetry-bridge maintain` runs it on demand with a health verdict as
+    # its exit code. Both work identically under compose, under an
+    # orchestrator, or from an operator's shell.
+    #
+    # Turning the worker on instead needs pg_partman_bgw.role flipped to a
+    # LOGIN role with credentials, a server restart to change its database,
+    # and it reports failure nowhere but the server log -- at WARNING, which
+    # is below anything a log gate reads. Pointed at a database the chain has
+    # not yet migrated it fails every cycle. Unsupported here.
     command:
       - "postgres"
       - "-c"
@@ -382,8 +390,8 @@ services:
       retries: 12
       start_period: 30s
 
-  # One-shot: brings the database up to the migration chain, mints the login
-  # users the two services below connect as, and loads the organization and
+  # One-shot: brings the database up to the migration chain, mints the three
+  # login users the services below connect as, and loads the organization and
   # property projections. Runs to completion and stays exited; compose restarts
   # it on every `up`, which is intended — every step is idempotent, and a second
   # run applies no migrations and rewrites the same rows.
@@ -417,6 +425,12 @@ services:
       FARM_BRIDGE_LOGIN_PASSWORD: ${FARM_BRIDGE_LOGIN_PASSWORD:-changeme-bridge}
       FARM_API_LOGIN_USER: ${FARM_API_LOGIN_USER:-farmdata_api}
       FARM_API_LOGIN_PASSWORD: ${FARM_API_LOGIN_PASSWORD:-changeme-farm-api}
+      # The third pair is the one whose role owns tables: partman_maintainer
+      # owns telemetry.reading and telemetry.ingest_event, because creating
+      # and dropping their partitions requires owning the parent and no GRANT
+      # confers ownership.
+      FARM_BRIDGE_MAINT_LOGIN_USER: ${FARM_BRIDGE_MAINT_LOGIN_USER:-farmdata_maint}
+      FARM_BRIDGE_MAINT_LOGIN_PASSWORD: ${FARM_BRIDGE_MAINT_LOGIN_PASSWORD:-changeme-maint}
       # A path inside the container: the mount below, not a host path.
       FARM_PROJECTION_SEED: /seed/projection.json
     volumes:
@@ -490,6 +504,23 @@ services:
       # key. scripts/farm-e2e.sh asks for one on demand with SIGUSR2 rather
       # than waiting out this interval.
       FARM_BRIDGE_REPORT_INTERVAL_SECONDS: ${FARM_BRIDGE_REPORT_INTERVAL_SECONDS:-300}
+      # Partition maintenance: one run before the daemon opens its broker
+      # connection, then daily. Its own credential, passed under its own name
+      # rather than through FARM_POSTGRES_USER above — that slot is the
+      # writer's, and these are two different roles on purpose. Creating and
+      # dropping partitions requires *owning* the partition sets, ownership is
+      # the one privilege no GRANT can confer, and the procedure commits
+      # internally, so it can be neither granted to bridge_writer nor assumed
+      # with SET LOCAL ROLE on its session.
+      #
+      # Left blank the daemon still runs, announces that maintenance is
+      # unscheduled at startup, and repeats it in every ingest report — which
+      # is the posture to avoid: an unmaintained partition set looks perfect
+      # until the month premake last reached, and is unrecoverable by anything
+      # short of a runbook afterwards.
+      FARM_BRIDGE_MAINT_LOGIN_USER: ${FARM_BRIDGE_MAINT_LOGIN_USER:-farmdata_maint}
+      FARM_BRIDGE_MAINT_LOGIN_PASSWORD: ${FARM_BRIDGE_MAINT_LOGIN_PASSWORD:-changeme-maint}
+      FARM_BRIDGE_MAINTAIN_INTERVAL_SECONDS: ${FARM_BRIDGE_MAINTAIN_INTERVAL_SECONDS:-86400}
     volumes:
       - shared:/shared:ro                                    # the provisioner's config.json
       - ./farm/bridge-entrypoint.sh:/farm/bridge-entrypoint.sh:ro
