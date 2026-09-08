@@ -504,6 +504,271 @@ which is intended — every step is idempotent, so a second run applies no migra
 the same rows. If the bridge or the API report *"dependency failed to start"*, that one-shot is
 where to look: `docker compose logs farmdata-migrate`.
 
+### Proving it end to end
+
+`scripts/farm-e2e.sh` boots the farm profile with the mock fleet and walks the whole path: uplinks
+land as normalized, property-stamped readings, every metric resolves in the dictionary, the store
+answers GraphQL, a device is curated through the curation API, and the curation-lag alarm is
+asserted by its exit code. Two properties are seeded rather than one, so **property stamping across
+a placement change** is provable at all: a device is moved onto the second through the curation API
+and its readings split at the move instant — everything measured before it keeps the property it was
+measured under, everything after takes the new one. A synthetic message carries the sharp edge, since
+the mock fleet has no datalogger to emit one: a single uplink whose `history[]` entry is timestamped
+inside the closed window and whose own reading is measured now lands **two readings on two
+properties from one batch**, which is the whole of what "as of measurement time" means. It also
+publishes a `join` and a `status` event so `telemetry.device_event` is exercised, and redelivers
+both to prove the lifecycle key dedupes — those are fixtures because they have to be: the mock fleet
+is ABP-activated and requests no device status, so ChirpStack publishes neither event for it. It then
+puts the path under the nine failures it has to survive — the
+database stopped underneath it, the bridge stopped while the broker keeps receiving, the bridge
+killed outright, then the broker itself restarted under a live bridge, restarted with a backlog
+queued, and killed outright, then the whole box power-cycled at once, and finally the database and
+the broker each *frozen* rather than stopped — and checks that
+ingestion resumes each time with nothing left behind. Each
+recovery is asserted per message rather than by count: the uplink ids
+ChirpStack's archive held at the moment the failure ended all have to reach `farmdata`, and since
+the mock fleet publishes throughout, only a set can carry that — a count bar taken at the same
+moment is met by the next few uplink rounds with the whole backlog discarded. A red step names the
+uplinks that went missing.
+
+**The broker steps are the load-bearing half**, because the bridge holds nothing in its own process:
+it acknowledges a message only after committing the reading, and leans on the broker's
+persistent-session queue as the buffer. So mosquitto's durability *is* the "an outage costs latency,
+not data" guarantee rather than a detail of it — and that guarantee has a scope worth stating.
+`persistence true` is a periodic **checkpoint**, not a journal: mosquitto writes its session database
+on a clean exit, on `SIGUSR1`, and every `autosave_interval` seconds, and nowhere else. A broker that
+shuts down cleanly hands the queue back intact. A broker killed outright hands back only what its
+last checkpoint caught, and mosquitto's default interval is 1800 seconds — so `mosquitto.conf` sets
+**30s**, and the killed-broker step stops the mock fleet and then waits one interval, read from that
+file, before pulling the plug — so the whole archive has been checkpointed when the kill lands and
+every uplink in it is asserted to survive.
+
+Stopping the fleet is what makes that sound rather than lucky. The step's own assertion covers only
+the set it froze, but the end-of-run check covers the **whole** archive, and an uplink archived after
+the last checkpoint tick dies unsaved in the SIGKILL. Left publishing, the step would be staking the
+run's strongest assertion on where the autosave clock happened to be — and a bench that genuinely
+loses an uplink stays red on every later run until its volumes are destroyed. So the residual window
+is real and is stated rather than tested: an unclean death costs up to `autosave_interval` seconds of
+queue. That is the guarantee's scope, and the bench stays outside it by construction.
+
+What an unclean death costs is the whole session, not just its queue: the reconnect comes back with
+session-present clear, meaning the broker has forgotten the *subscription* as well. A subscriber that
+subscribed once at startup would then sit connected to a broker that never speaks to it again — a
+farm going quiet rather than a farm losing a few readings, and silent on both sides. The bridge
+re-subscribes on every connect, and the first broker step asserts that end to end by bouncing the
+broker under a live bridge and watching ingestion continue.
+
+The last broker step also asserts that the **publish** path recovered, not just the consumer. Every
+other comparison is against uplinks the archive held *before* the broker died, so a ChirpStack or
+gateway bridge that never reconnected would leave both stores frozen at identical contents and pass
+every check — including the settled one at the end, which compares the two stores to each other. So
+it waits for the archive to grow again: a fresh uplink getting all the way from a mock sensor through
+the gateway bridge, the restarted broker, and ChirpStack into `event_up`.
+
+Nothing published *through* a stopped broker reaches either store — the gateway bridges reach
+ChirpStack over mosquitto too — so both stores go quiet together while it is down, which is what
+keeps the per-message comparison honest across a broker outage.
+
+**The seventh failure is the one an operator actually asks about.** The other six each break one
+component, and six recoveries composing is a different claim from one whole-box recovery. So the last
+step power-cycles everything in a single `docker compose restart` — which is not the same as a
+`down`/`up`, and the difference is the point: `depends_on` conditions gate `up`, not `restart`, so
+the bridge loses its `mosquitto: service_healthy` gate and `farmdata-api` loses both of its. That is
+exactly what a Docker daemon coming back after a power cut does to them, and nothing else here
+reaches it. Nor is it theoretical: on a verified run compose brought `mock-sensors` up *first* —
+before the ChirpStack and gateway bridge it publishes through existed — started `telemetry-bridge`
+and `farmdata-api` *before* `farm-postgres`, and left `farm-postgres` and `redis` for last. Every
+one of those orderings is forbidden on `up`. Four things only this step exercises: the bridge starting cold against a half-up broker
+and database; `farmdata-api` racing `farm-postgres`; the three one-shots (`provisioner`,
+`events-schema-wait`, `farmdata-migrate`) re-running, whose idempotency was asserted in prose and
+nowhere else; and redis, `chirpstack-postgres`, ChirpStack and the gateway bridge all re-forming the
+publish chain in no particular order.
+
+It carries three assertions no other step can make. Each one-shot re-ran **and** exited 0 — checked
+by `StartedAt`, because a container that was skipped has the same status and exit code as one that
+succeeded, so the exit code alone would pass over a compose version that quietly left them alone.
+The provisioner **reused** the tenant API key rather than minting a new one: the token is only
+returned at creation, so a re-mint would leave the running bridge holding the old one and every
+reconcile sweep 401ing while ingest carried on looking healthy. And the operator's curated placement
+survived, which is the only thing checking that `farmdata-migrate` re-applying over a warm database
+leaves a person's decision alone.
+
+**This step quiesces the fleet first, and that is a scope limit rather than caution.** ChirpStack
+dispatches its integrations concurrently — `futures::future::join_all`, not the order
+`enabled=["mqtt","postgresql"]` is written in — so for any uplink it is handling, the MQTT publish
+and the `event_up` write race each other, and a publish refused by a broker going down in the same
+window is logged rather than retried. An uplink can therefore land in the archive with its publish
+never having happened: an id `farmdata` will never receive, which reddens the end-of-run comparison
+on this run and every later one against a kept bench. Nothing downstream can fix it, because the two
+integrations are not transactional with each other. **So the ingest guarantee begins at the broker,
+not at ChirpStack** — the same shape of scoping as the checkpoint window above, and the reason the
+fleet is stopped and allowed to settle before the plug is pulled. What makes the frozen set mean
+anything with the fleet quiet is the backlog: the bridge is stopped for a few uplink rounds first, so
+the ids being waited for are genuinely still in the broker rather than already in `farmdata`.
+
+**The eighth and ninth failures are a different shape from the seven before them, and that is the
+point of adding them.** A stop, a kill and a restart are all _polite_: the socket closes, so the
+peer's departure arrives as an error and every waiter is woken by something the kernel said out
+loud. `docker compose pause` sends SIGSTOP, which closes nothing — established connections stay
+established, the kernel keeps completing handshakes on the stopped process's behalf, and nothing
+ever answers. Every wait on such a peer is unbounded unless the waiter brought its own bound, and a
+bridge sitting inside one looks exactly like a bridge with nothing to do.
+
+So those two steps assert that the wedge is **visible** — a bounded-deadline line in the log, a
+rising `writeRetries` in the bridge's own counter report — rather than that nothing was lost, which
+while a peer is frozen is not a claim anyone can make: nothing is acknowledged, so nothing can be.
+The counter matters more than it looks, because the expectation _inverts_ between the two database
+failures. Across the clean stop/start of failure 1, `writeRetries` is legitimately 0: the socket
+error reaches the writer session's reconnect loop first, and the consumer only ever sees one slow
+write. Under a freeze it cannot be 0, because there is no socket error for that loop to absorb.
+
+**The `farmdata-api` check after failure 8 asserts less than it looks like it does**, which is worth
+stating rather than letting a green step imply the stronger thing. The read API is *idle* for the
+whole freeze — nothing in the step queries it — so its pool has no statement in flight, and an idle
+pooled connection going quiet costs nothing: the first query after the thaw answered in 29 ms with
+`RestartCount` still 0, so it never died and `restart: unless-stopped` never fired. That a freeze
+the read API slept through leaves it working is worth knowing, and it is not the same as recovering
+from a wedge. Testing the wedge means holding a query open across the freeze; PostGraphile's pool
+has no Node-side statement bound, so the honest expectation is that it hangs, and the fix would be a
+`query_timeout` in `farm-api/server.js` rather than another assertion. Unlike the bridge, nothing is
+lost either way — a stateless reader that restarts is a liveness question, not an ingest one.
+
+Failure 9 quiesces the fleet first for exactly the `join_all` reason failure 7 does. What ends the
+silence there is MQTT keepalive and nothing else, so the step reads the interval out of the bridge
+image rather than carrying a copy and scales its own patience to it — and it has to prove the bridge
+is _connected and subscribed_ before freezing the broker, because a bridge caught mid-reconnect
+would be bounded by mqtt.js's `connectTimeout` instead, which is a different mechanism and a weaker
+claim. `wait_for_broker` does not show that; it says the broker answers a probe of the script's own.
+
+**Failure 9 deliberately makes no backlog claim, and the first draft did.** The bridge drains a few
+hundred messages a second, so a backlog queued before the freeze is already in `farmdata` by the
+time the pause lands — and with the fleet quiesced, a set frozen from the archive is satisfied
+before the freeze even begins. It would have passed without the broker being touched. The "session
+survived" claim needs the CONNACK's session-present flag, which is invisible from out here; the
+bridge repo's own proof owns it. What this step asserts instead is ingest resuming end to end: the
+fleet restarts, a _new_ uplink has to reach the archive, and only then does every id the archive
+holds have to reach `farmdata` — a set that now contains uplinks which did not exist before the
+freeze.
+
+One practical note if you write another of these: nothing can read `farmdata` while `farm-postgres`
+is paused. `farm_psql` and `wait_for_broker` are `docker compose exec`, and the daemon refuses that
+against a paused container outright — immediately, not by hanging. The bridge's experience of the
+same container is the opposite, and the asymmetry is the whole subject: it holds a TCP connection
+SIGSTOP never closed, so its statement goes quiet with no error at all.
+
+The database-outage step re-asserts `farmdata-api` itself as well, not only the store behind it.
+Every other check after a failure reads `farmdata` through `psql`, so a read API left dead by a
+database blip would pass the rest of the run — and unlike the bridge, it has no retry loop of its
+own: it takes the connection error, exits, and comes back only because it carries
+`restart: unless-stopped`. That policy is load-bearing, so something has to prove it. The check
+looks at the response body rather than the port, because PostGraphile stays up and listening while
+it retries introspection, answering nothing but errors.
+
+**Then it sends the path bad data**, which is the other half of what a farm produces and the half
+this bench never saw. Four steps, and the first is why the section exists: the bridge is serial and
+acknowledges a message only after committing it, so a message it fails to ack stays at the head of
+the broker's queue and is redelivered forever with everything behind it waiting. A poison message
+that is not acked therefore does not lose one reading — it stops the farm, silently, until somebody
+notices. So garbage is published into the middle of an offline backlog, real uplinks on both sides
+of it, and the whole backlog has to drain past it. Then timestamps a decoder should never emit: a
+message ten minutes in the future, which is dropped **whole** because `occurred_at` is the raw
+table's partition key and a row in the kept default partition blocks that month's partition from
+ever being created; and an ancient reading inside a `history[]` entry, where the blast radius is
+deliberately different — that reading is dropped and the raw capture is kept. Then a redelivery,
+published twice on purpose. And last, a device whose ChirpStack codec throws on every uplink, whose
+raw capture has to land with **no decoded readings**, because ingestion is never gated on decode.
+Not *zero* readings: the adapter mints `gatewayRssi`/`gatewaySnr` from the uplink's `rxInfo`
+whenever `FARM_BRIDGE_SIGNAL_HEALTH` is on, which is radio metadata rather than anything the codec
+produced — so a device with no working decoder still reports how well it was heard, and the step
+asserts that too, since a device with no uplinks at all would satisfy the zero on its own.
+
+**Two of those are only assertable because the daemon now reports its counters.** A message the
+bridge drops deliberately leaves no row to find, and a redelivery that was correctly deduped leaves
+exactly the rows a redelivery that never happened would — every trace of a successful replay is
+collapsed by a primary key. So the bridge logs `getReport()` on an interval
+(`FARM_BRIDGE_REPORT_INTERVAL_SECONDS`, default 300), once more on shutdown, and immediately on
+`SIGUSR2`, which is what the script uses: `docker compose kill -s USR2 telemetry-bridge` and read
+the `ingest report:` line. The one trap is worth knowing before writing another step on it — **a
+bridge restart is a new process and every counter starts at zero**, so a mark taken before a step
+that stops or kills the bridge is not a baseline for anything after it.
+
+The broken-codec device is a real one, provisioned by `mock-sensors` like the other 23, sending real
+decode-verified bytes behind a profile carrying a codec that raises. That is the only way to learn
+what ChirpStack itself does with a failing decoder — it publishes and archives the uplink anyway,
+with no `object` — which is the fact everything downstream rests on.
+
+```sh
+bash scripts/farm-e2e.sh              # tears the stack down afterwards
+FARM_E2E_KEEP=1 bash scripts/farm-e2e.sh   # leave it running (fast iteration)
+```
+
+It takes around twenty-five minutes, most of it waiting on uplink rounds, on containers
+stopping and starting, on the one checkpoint interval the killed-broker step sits through, on the
+bridge's own 30s write deadline expiring under the frozen database, and on
+the offline backlogs the poison and broker-freeze steps have to build before they have anything to
+drain. Counts are asserted
+as floors, never as exact fleet totals: `mock-sensors` sends one unacknowledged UDP datagram per
+uplink with no retransmit, so an occasional frame never reaches ChirpStack at all, and that is a
+transport flake rather than a bridge regression. What proves nothing was lost is the comparison
+against ChirpStack's own archive, which is flake-immune for the same reason — a datagram that never
+arrived is in neither store, so it is on neither side of it.
+
+The deterministic versions of those failures — including a daemon killed in the exact window between
+its commit and the message's acknowledgment, and a broker whose persisted session is deleted
+outright — live in the telemetry-bridge repo's own `npm run db:exercise:resilience`, which can drive
+the consumer in-process and read the CONNACK's session-present flag directly. This script proves the
+same recoveries for the packaged daemon on the real ChirpStack path. The power cycle has a
+counterpart there too, and the split is the same: that exercise restarts the broker and the database
+in one call under a live consumer, so it can assert on the consumer's own counters that both
+reconnect loops recovered and neither wedged the other, while what only this script can show is the
+other ten services coming back with it.
+
+The deliberate total loss stays over there for a reason: an uplink destroyed on this bench is missing
+from `farmdata` for good, so it would fail the end-of-run "nothing was lost" comparison on this run
+and every later run against a kept bench. The bridge's fixtures are reserved device EUIs it deletes
+at the start of each run, so it can afford to destroy a session and assert what that costs.
+
+That in-process form is also the only place a redelivery can be **observed**. Every trace of one is
+collapsed by a primary key — `reading`, `reading_latest`, `ingest_event` and `device_event` all
+dedupe on conflict — and the daemon logs connection lifecycle, faults and shutdown but never its
+counters, so from out here a replay that was deduped and a redelivery that never happened are
+indistinguishable. Successful idempotence is silent by construction. What this script can prove
+after the kill is that ingestion resumed and nothing was lost; that the replay wrote nothing twice
+is asserted in the bridge repo, against counters.
+
+The same split applies to the placement steps. What the bench proves is the claim through the real
+pipe: a real fleet device moved through the real curation API, whose readings then accumulate either
+side of the move for the rest of the run and are split at the end. What the bridge repo's
+`npm run db:exercise:placement` adds is the case this script deliberately leaves out — a *backdated*
+correction, which does **not** re-stamp readings already stored. That has to live over there: a
+device whose history was corrected retroactively is exactly a device whose stored stamps no longer
+agree with its current windows, and this run ends by asserting that agreement over every reading in
+the database. Deterministic proof there, exact invariant here.
+
+**The run ends with four cross-table sweeps**, and they are last because that is the only moment
+nothing is racing and there is a full run's worth of rows to be wrong about. `reading_latest` must
+equal the true newest reading for every `(device, metric, channel)` — timestamp *and* value, since an
+intra-batch collision resolved one way in the fact table and the other in the mirror would publish a
+value no reading row holds. Every reading a placement window covers must carry that window's
+property; the readings no window covers are counted and explained rather than ignored, and there are
+two honest reasons for one — a device's first uplink is measured a moment *before* the window
+auto-registration opens for it, and a codec may supply its own measurement `time`, so a datalogger
+reading can legitimately predate the device's registration by months (this bench's GPS tracker emits
+one about seventy days back). Both take the writer's documented fallback. What is *not* honest is an
+uncovered reading measured **after** its device's history began: that means the history has a gap and
+the fallback answered for a measurement some window should have owned, and it is asserted to be zero.
+The moved device's split is asserted per row against the move instant the API wrote. And the
+lifecycle fixtures are still exactly the rows they wrote.
+
+Then the posture the rest of it rests on: **every published `farm` port is asserted to be bound to
+`127.0.0.1`**, read out of the running containers rather than out of `docker-compose.yml` so an
+`.env` override is caught too. The curation API writes and has no authentication and no TLS; the
+GraphQL layer exposes every reading with GraphiQL on. Both are safe on this bench only because of
+that bind, so a compose edit dropping the prefix would publish an unauthenticated write API to the
+network — and until this step, nothing in the run would have noticed. Scoped to the farm profile
+deliberately: mosquitto, ChirpStack, its REST gateway, both gateway bridges and Leftenant are
+published unbound on purpose, being the LAN-facing half of the bench.
+
 ### Querying it
 
 ```sh
@@ -549,6 +814,25 @@ curl -s -X POST http://localhost:8092/v1/devices/<device-id>/assignment \
 Re-sending an identical request answers `changed: false` rather than writing again. `GET /` lists
 every verb.
 
+Confirming a device is on the property it already defaulted to **is** a curation, not a no-op: until
+a person says so the placement was written by a machine, and the response says `confirmed_placement`
+precisely because the property did not change. That is the commonest thing an operator does here.
+
+### The curation-lag alarm
+
+The guard against readings being quietly attributed to the property a device defaulted to rather
+than the one it is really on. It reports auto-created devices that have gone more than
+`FARM_BRIDGE_CURATION_LAG_DAYS` (default 7) without anyone placing them, and it is a subcommand of
+the bridge rather than an endpoint, so a cron job or a monitor can read its exit code:
+
+```sh
+docker compose run --rm --no-deps telemetry-bridge curation-lag
+# 0 = nothing lagging · 2 = devices are lagging · 1 = the check itself failed
+```
+
+The same check also runs on a timer inside the daemon (`FARM_BRIDGE_CURATION_CHECK_INTERVAL_SECONDS`),
+where it writes the same report to the log.
+
 **Two things to know before pointing anything at it.** It serves no authentication and no TLS in
 this release, which is why it is published on loopback only. And any request carrying an `Origin`
 header is refused with 403 — deliberately, since there is no auth to protect a browser caller with
@@ -556,10 +840,18 @@ header is refused with 403 — deliberately, since there is no auth to protect a
 
 ### Where the values come from
 
-`farm/projection.json` is the bench's organization and property, and it has exactly one job beyond
+`farm/projection.json` is the bench's organization and properties, and it has exactly one job beyond
 seeding: `FARM_BRIDGE_PROPERTY_ID` is left blank in `.env` and derived from this file's
 `default_property_id`, so the property the seeder writes and the property the bridge uses cannot
 drift apart. Point at a real property by editing this file, not by pasting a UUID in two places.
+
+It seeds **two** properties — Bench Field, which is the default every uncurated device lands on, and
+Bench South Field, which exists so there is somewhere to move a device *to*. That is not decoration:
+with one property seeded, "every reading is stamped with the property valid when it was measured" has
+only one answer it could possibly give, and the end-to-end script's placement steps would be
+asserting nothing. Adding a property is an addition to `properties[]` and nothing else — the seeder
+upserts on every `up`, and leaving `default_property_id` alone keeps the bridge's derivation and
+every existing assertion unchanged.
 
 The ChirpStack API key the inventory reconciler uses is read from `/shared/config.json` — minted by
 the provisioner at run time, so no environment variable can carry it. That is the same file
@@ -567,15 +859,56 @@ Leftenant reads.
 
 ### Partition maintenance
 
-`reading` and `ingest_event` are partitioned monthly with retention, and **nothing on this bench
-runs maintenance automatically** — the pg_partman background worker is preloaded but deliberately
-left unpointed, since aiming it at a database before the chain has installed pg_partman makes it
-fail every cycle. Premake covers the near term. To run it by hand:
+`reading` and `ingest_event` are partitioned monthly with retention, and **the bridge daemon
+maintains them**: one pass before it opens its broker connection, then every
+`FARM_BRIDGE_MAINTAIN_INTERVAL_SECONDS` (default a day). The startup pass is the load-bearing half —
+premake keeps three months of children ahead, so a box powered off for longer than that would
+otherwise write its first uplink into a default partition, and a default partition holding a row for
+some month is what makes a partition set permanently unmaintainable. The pg_partman background
+worker is still preloaded but stays unpointed, and is not the mechanism here.
+
+On demand, and for a monitor:
 
 ```sh
-docker compose exec farm-postgres psql -U farmdata_owner -d farmdata \
-  -c "SELECT partman.run_maintenance()"
+docker compose run --rm --no-deps telemetry-bridge maintain
+# 0 = every set healthy · 2 = a set is degraded · 1 = the run could not happen
 ```
+
+`--no-deps` is the point of that line, and the entrypoint hands `maintain` straight through without
+waiting for the provisioner's `/shared/config.json` or deriving a default property: this command
+needs the database and nothing else, and it is typed when the rest of the box is already in trouble.
+Anything else it demanded would be another way to exit 1 for a reason that is not the database — the
+one answer its exit code is supposed to mean.
+
+**The exit code is the verdict, and it has to be.** pg_partman answers a partition set it cannot
+maintain with `RAISE WARNING`, nulls that set's `maintenance_last_run`, and returns successfully —
+so nothing downstream of an exit status can see the one condition worth paging on. The run is
+followed by three catalog reads: that maintenance actually moved for every set, that a child already
+covers traffic 45 days out (the forward check, which fires with weeks of margin), and that no
+default partition holds a row past its newest child. The verdict also rides on the bridge's ingest
+report, under `maintenance`.
+
+That `WARNING` is also the only place the *reason* exists, so it is repeated rather than left in the
+server's log: the run logs it as `partition maintenance: the server warned during the run: …` and
+carries it on the ingest report as `maintenance.lastWarnings`. A verdict that named the sick table
+and pointed at a log file for the rest would be a dead end on a box nobody can walk up to.
+
+The headroom check on its own, if you want to ask the database directly:
+
+```sh
+docker compose exec farm-postgres psql -U farmdata_owner -d farmdata -c \
+  "SELECT pc.parent_table,
+          (partman.show_partition_name(pc.parent_table,
+             (now() + interval '45 days')::text)).table_exists
+     FROM partman.part_config pc"
+```
+
+Maintenance connects as `FARM_BRIDGE_MAINT_LOGIN_USER`, a member of `partman_maintainer`, which
+**owns** both partition sets — `ATTACH PARTITION` and `DROP PARTITION` require owning the parent and
+no `GRANT` confers ownership. Leave that pair blank and the daemon still runs, says maintenance is
+unscheduled at startup, and repeats it in every ingest report. The full reasoning, and the runbook
+for a `degraded` answer, are in the telemetry-bridge repo's README under "Partitioning and
+retention".
 
 ## Region / sub-band
 
@@ -813,7 +1146,7 @@ The `farm` profile adds three more, all off unless you name the profile:
 - **The curation API has no authentication and no TLS**, and it writes. It is published on loopback
   only for that reason; move that bind only behind both. It refuses any request carrying an `Origin`
   header, which is what keeps a browser page from reaching it, not a substitute for auth.
-- **`farmdata` ships placeholder passwords** for the owner and for both minted login users. The two
+- **`farmdata` ships placeholder passwords** for the owner and for all three minted login users. The
   services connect as least-privilege logins rather than the owner — the GraphQL layer holds
   `SELECT` and nothing else, which is what makes it read-only by role rather than by convention —
   but the passwords are still `changeme-*` until you rotate them.

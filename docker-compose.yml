@@ -59,6 +59,20 @@ services:
       # discarded with it, so a durable subscription would survive a broker
       # restart but not a `docker compose up` that recreates the container.
       - mosquitto-data:/mosquitto/data
+    # The broker has no readiness signal of its own otherwise, and two things
+    # want one: `up --wait` gating the bridge on a broker that is actually
+    # accepting connections, and scripts/farm-e2e.sh waiting for one it has just
+    # restarted or killed. A publish is the probe rather than an open port --
+    # mosquitto binds the listener before it has finished reading its own
+    # persisted sessions. Anonymous, so it needs no credential; QoS 0 and a
+    # throwaway topic, so it queues for nobody and the auto-generated client id
+    # cannot collide with the bridge's persistent session.
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_pub -h 127.0.0.1 -p 1883 -t healthcheck -m ping -q 0"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
 
   chirpstack:
     image: chirpstack/chirpstack:4
@@ -482,10 +496,18 @@ services:
     # shared_preload_libraries costs a restart, so the worker is preloaded from
     # first boot even though it stays idle.
     #
-    # pg_partman_bgw.dbname is deliberately EMPTY. Pointing the background
-    # worker at a database before the migration chain has installed pg_partman
-    # makes it fail every cycle and log at ERROR. Set it only against a database
-    # farmdata-migrate has already migrated at least once.
+    # pg_partman_bgw.dbname is deliberately EMPTY, and the worker is not how
+    # maintenance runs here: the telemetry-bridge daemon schedules it (one pass
+    # before it opens its broker connection, then daily) and
+    # `telemetry-bridge maintain` runs it on demand with a health verdict as
+    # its exit code. Both work identically under compose, under an
+    # orchestrator, or from an operator's shell.
+    #
+    # Turning the worker on instead needs pg_partman_bgw.role flipped to a
+    # LOGIN role with credentials, a server restart to change its database,
+    # and it reports failure nowhere but the server log -- at WARNING, which
+    # is below anything a log gate reads. Pointed at a database the chain has
+    # not yet migrated it fails every cycle. Unsupported here.
     command:
       - "postgres"
       - "-c"
@@ -536,8 +558,8 @@ services:
       retries: 12
       start_period: 30s
 
-  # One-shot: brings the database up to the migration chain, mints the login
-  # users the two services below connect as, and loads the organization and
+  # One-shot: brings the database up to the migration chain, mints the three
+  # login users the services below connect as, and loads the organization and
   # property projections. Runs to completion and stays exited; compose restarts
   # it on every `up`, which is intended — every step is idempotent, and a second
   # run applies no migrations and rewrites the same rows.
@@ -571,6 +593,12 @@ services:
       FARM_BRIDGE_LOGIN_PASSWORD: ${FARM_BRIDGE_LOGIN_PASSWORD:-changeme-bridge}
       FARM_API_LOGIN_USER: ${FARM_API_LOGIN_USER:-farmdata_api}
       FARM_API_LOGIN_PASSWORD: ${FARM_API_LOGIN_PASSWORD:-changeme-farm-api}
+      # The third pair is the one whose role owns tables: partman_maintainer
+      # owns telemetry.reading and telemetry.ingest_event, because creating
+      # and dropping their partitions requires owning the parent and no GRANT
+      # confers ownership.
+      FARM_BRIDGE_MAINT_LOGIN_USER: ${FARM_BRIDGE_MAINT_LOGIN_USER:-farmdata_maint}
+      FARM_BRIDGE_MAINT_LOGIN_PASSWORD: ${FARM_BRIDGE_MAINT_LOGIN_PASSWORD:-changeme-maint}
       # A path inside the container: the mount below, not a host path.
       FARM_PROJECTION_SEED: /seed/projection.json
     volumes:
@@ -594,8 +622,12 @@ services:
         condition: service_completed_successfully
       provisioner:
         condition: service_completed_successfully
+      # Healthy rather than started: this is the one service whose persistent
+      # session the broker has to be ready to restore before it connects. The
+      # gateway bridges and ChirpStack stay on `service_started` -- they publish,
+      # so a broker that is a second behind costs them a retry, not a session.
       mosquitto:
-        condition: service_started
+        condition: service_healthy
       chirpstack-rest-api:
         condition: service_started
     environment:
@@ -633,6 +665,30 @@ services:
       FARM_BRIDGE_CURATION_PORT: "8091"
       FARM_BRIDGE_CURATION_LAG_DAYS: ${FARM_BRIDGE_CURATION_LAG_DAYS:-7}
       FARM_BRIDGE_CURATION_CHECK_INTERVAL_SECONDS: ${FARM_BRIDGE_CURATION_CHECK_INTERVAL_SECONDS:-3600}
+      # How often the daemon logs its ingest counters. They are the only
+      # outside evidence that a message was dropped deliberately rather than
+      # lost, and that a redelivery was deduped rather than never sent --
+      # every trace of a successful replay is otherwise collapsed by a primary
+      # key. scripts/farm-e2e.sh asks for one on demand with SIGUSR2 rather
+      # than waiting out this interval.
+      FARM_BRIDGE_REPORT_INTERVAL_SECONDS: ${FARM_BRIDGE_REPORT_INTERVAL_SECONDS:-300}
+      # Partition maintenance: one run before the daemon opens its broker
+      # connection, then daily. Its own credential, passed under its own name
+      # rather than through FARM_POSTGRES_USER above — that slot is the
+      # writer's, and these are two different roles on purpose. Creating and
+      # dropping partitions requires *owning* the partition sets, ownership is
+      # the one privilege no GRANT can confer, and the procedure commits
+      # internally, so it can be neither granted to bridge_writer nor assumed
+      # with SET LOCAL ROLE on its session.
+      #
+      # Left blank the daemon still runs, announces that maintenance is
+      # unscheduled at startup, and repeats it in every ingest report — which
+      # is the posture to avoid: an unmaintained partition set looks perfect
+      # until the month premake last reached, and is unrecoverable by anything
+      # short of a runbook afterwards.
+      FARM_BRIDGE_MAINT_LOGIN_USER: ${FARM_BRIDGE_MAINT_LOGIN_USER:-farmdata_maint}
+      FARM_BRIDGE_MAINT_LOGIN_PASSWORD: ${FARM_BRIDGE_MAINT_LOGIN_PASSWORD:-changeme-maint}
+      FARM_BRIDGE_MAINTAIN_INTERVAL_SECONDS: ${FARM_BRIDGE_MAINTAIN_INTERVAL_SECONDS:-86400}
     volumes:
       - shared:/shared:ro                                    # the provisioner's config.json
       - ./farm/bridge-entrypoint.sh:/farm/bridge-entrypoint.sh:ro

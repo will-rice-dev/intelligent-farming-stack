@@ -8,7 +8,7 @@
  * codec's own authored expectation, and with the transport metadata ChirpStack
  * reports matching what the emitter actually transmitted.
  *
- * Every data vector of every sensor is sent (52 uplinks over 23 devices), not
+ * Every data vector of every sensor is sent, over 24 devices, not
  * just the first. Three reasons:
  *   - the data rate is derived from the payload length, so it varies per *vector*
  *     as well as per sensor (decentlab/dl-trs12 is DR1 for its two 13-byte vectors
@@ -94,7 +94,7 @@ describe('mocked sensor uplinks flow through ChirpStack end-to-end', () => {
           // starts waiting, so an event that beat us to the broker is still found.
           //
           // Correlating on FCnt is what makes the wait trustworthy at all — the
-          // compose `mock-sensors` demo service publishes for these same 23
+          // compose `mock-sensors` demo service publishes for these same 24
           // DevEUIs every MOCK_INTERVAL_SECONDS, cycling every vector, so "the
           // next event for this DevEUI" is very often not ours.
           const evt = await collector.waitFor(
@@ -107,7 +107,18 @@ describe('mocked sensor uplinks flow through ChirpStack end-to-end', () => {
           expect(evt.deviceInfo?.devEui?.toLowerCase()).toBe(sensor.devEui);
           expect(eventFCnt(evt)).toBe(sent.fCnt);
           expect(evt.fPort).toBe(vector.fPort);
-          expect(evt.object).toEqual(vector.expected);
+          if (sensor.brokenCodec === true) {
+            // The whole reason this device is in the fleet: ChirpStack still
+            // publishes and still archives the uplink when the codec throws,
+            // it just has nothing decoded to attach. Asserted here rather than
+            // assumed, because everything downstream that claims "ingestion is
+            // never gated on decode" rests on it -- if ChirpStack instead
+            // swallowed the event, the farm store's zero-readings capture would
+            // be proving something else entirely.
+            expect(evt.object).toBeUndefined();
+          } else {
+            expect(evt.object).toEqual(vector.expected);
+          }
 
           // Transport metadata. Both values are derived per (sensor, vector) — the
           // DR from the payload length, the channel from the sensor index — so they
@@ -128,7 +139,15 @@ describe('mocked sensor uplinks flow through ChirpStack end-to-end', () => {
           expect(stored.fPort).toBe(vector.fPort);
           expect(stored.dr).toBe(sent.dr);
           expect(stored.txInfo?.frequency).toBe(sent.frequencyHz);
-          expect(stored.object).toEqual(vector.expected);
+          if (sensor.brokenCodec === true) {
+            // Same claim on the archive side. `object` is null rather than
+            // absent here: the PostgreSQL integration writes the column either
+            // way, which is exactly the "the row lands, the decode did not"
+            // shape the farm store mirrors.
+            expect(stored.object ?? null).toBeNull();
+          } else {
+            expect(stored.object).toEqual(vector.expected);
+          }
         });
       });
     });
