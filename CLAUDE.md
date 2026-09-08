@@ -61,13 +61,15 @@ Do not paste the full license into source files — the header points to LICENSE
   `EVENTS_POSTGRES_HOST_BIND` + `EVENTS_POSTGRES_WAL_LEVEL` — see the README.
 - The `farm` profile adds more of the same: the **curation API writes and has no auth and no TLS**
   (loopback-bound for that reason; its `Origin` refusal is not a substitute for auth), `farmdata`
-  ships placeholder passwords for the owner and both minted logins, and `farmdata-api` exposes
+  ships placeholder passwords for the owner and all three minted logins, and `farmdata-api` exposes
   every reading to anyone who can reach it with GraphiQL on by default.
 - **Login users are minted at deploy time, never by a migration.** `farmdata`'s service roles are
   NOLOGIN group roles — privilege carriers, not accounts — so that a frozen, hash-locked committed
   migration never holds a password. `farmdata-migrate` creates the accounts from the environment
   and grants each membership in exactly one role. Add a consumer there, not with a hand-written
-  `CREATE ROLE`.
+  `CREATE ROLE`. What membership cannot carry is **ownership**, which is why `partman_maintainer`
+  owns the two partition sets outright and partition maintenance gets a login pair of its own:
+  `ATTACH`/`DROP PARTITION` require owning the parent, and no `GRANT` confers that.
 
 ## Per-PR checklist
 - New files have the SPDX + copyright header

@@ -25,6 +25,30 @@ set -eu
 CONFIG=/shared/config.json
 SEED=/seed/projection.json
 
+# `maintain` is handed straight through, before anything below runs.
+#
+# It is the one subcommand that touches nothing this script supplies: it opens
+# a database connection with FARM_BRIDGE_MAINT_LOGIN_USER, runs pg_partman
+# maintenance, asserts the outcome and exits. No broker, no ChirpStack REST
+# call, no default property. Yet without this it would sit through the wait
+# below and then fail -- for a whole minute, then exit 1, because a
+# *provisioner* has not run.
+#
+# That matters because of when this command is typed. It is the by-hand
+# recovery path and the monitor's probe: `docker compose run --rm --no-deps
+# telemetry-bridge maintain`, with `--no-deps` precisely so nothing else has
+# to be up. Its exit code is the verdict -- 0 healthy, 2 a set is degraded, 1
+# the run could not happen -- and a 1 earned here would be a 1 about the
+# shared volume wearing the clothes of a 1 about the database, on the one path
+# that only ever runs when something is already wrong.
+#
+# `reconcile` and `curation-lag` are deliberately not short-circuited:
+# reconcile needs the API key this script reads, and curation-lag resolves the
+# full bridge config, which requires the default property derived below.
+if [ "${1:-}" = "maintain" ]; then
+  exec node /app/dist/cli.js "$@"
+fi
+
 # The provisioner is gated on with `service_completed_successfully`, so the file
 # is normally already there. The wait covers the case that ordering cannot: a
 # `shared` volume recreated under a provisioner container that compose considers

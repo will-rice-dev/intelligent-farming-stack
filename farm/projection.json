@@ -15,6 +15,15 @@
       "timezone": "America/Chicago",
       "lat": 41.8,
       "lon": -93.1
+    },
+    {
+      "property_id": "0198f3c1-7a40-7000-8000-000000000102",
+      "organization_id": "0198f3c1-7a40-7000-8000-000000000001",
+      "name": "Bench South Field",
+      "status": "active",
+      "timezone": "America/Chicago",
+      "lat": 41.7,
+      "lon": -93.2
     }
   ],
   "default_property_id": "0198f3c1-7a40-7000-8000-000000000101"
