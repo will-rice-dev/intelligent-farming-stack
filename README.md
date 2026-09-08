@@ -68,6 +68,11 @@ intelligent-farming-stack && bash setup.sh` (or `.\setup.ps1`) does the same.
 - ChirpStack REST API: http://localhost:8090
 - Device-event GraphQL (PostGraphile): http://localhost:5050/graphql — GraphiQL IDE at http://localhost:5050/graphiql
 
+With the [farm profile](#farm-telemetry-store--graphql-farm-profile) running, two more:
+
+- Farm telemetry GraphQL: http://localhost:5051/graphql — GraphiQL IDE at http://localhost:5051/graphiql
+- Curation API: http://localhost:8092 — **no authentication, no TLS**; loopback only
+
 The first run builds Leftenant from its public repo and pulls the ChirpStack/Postgres/etc. images, so
 it needs network access and takes a few minutes. The setup script waits for the one-shot provisioner
 and prints these URLs; you can also check it with `docker compose logs provisioner`.
@@ -191,6 +196,22 @@ Leftenant (browser :4173) --(REST :8090, CORS)--> chirpstack-rest-api --> chirps
 ChirpStack keeps its MQTT integration (Leftenant's browser join monitor subscribes to it) **and**
 adds the PostgreSQL integration, which is the durable store `events-api` reads from.
 
+With the `farm` profile, a second consumer subscribes to the same MQTT integration and writes
+normalized readings instead of raw events:
+
+```
+   MQTT integration (qos 1) --> mosquitto --> telemetry-bridge --> farm-postgres (farmdata)
+                                                   |                     |
+                    (REST :8090) chirpstack-rest-api                farmdata-api
+                        inventory reconciler                   (PostGraphile, GraphQL :5051)
+                                                   |
+                              operator --> curation API :8092 (place a device on a property)
+```
+
+The two stores answer different questions and neither reads the other: `events-postgres` archives
+ChirpStack's own event shape verbatim, while `farmdata` holds per-metric readings with a shared
+vocabulary, so two sensors from different vendors land as interchangeable data.
+
 ## Ports
 
 | Port | Service | Notes |
@@ -205,6 +226,9 @@ adds the PostgreSQL integration, which is the durable store `events-api` reads f
 | 5050 | events-api | GraphQL (loopback by default; 5000 avoided — macOS AirPlay) |
 | 5434 | events-postgres | host-side psql/export; loopback by default — `EVENTS_POSTGRES_HOST_BIND` to expose (see below) |
 | — | leadsman | publishes **no** port. It only talks to `events-postgres`; alerts are read via `events-api` or POSTed outbound |
+| 5051 | farmdata-api | *(farm profile)* GraphQL over the telemetry store; loopback by default |
+| 5436 | farm-postgres | *(farm profile)* host-side psql; loopback by default |
+| 8092 | telemetry-bridge | *(farm profile)* curation API — **no auth, no TLS**; loopback by default |
 
 ## Device event store & GraphQL
 
@@ -437,6 +461,122 @@ To run the stack **without** Leadsman, clear `POSTGRES_LEADSMAN_USER` / `POSTGRE
 set `EVENTS_API_SCHEMAS=public`, and remove the `leadsman` / `leadsman-migrate` services along with
 `events-api`'s `depends_on` entry for the latter.
 
+## Farm telemetry store & GraphQL (`farm` profile)
+
+The event store above keeps ChirpStack's own event shape. The **farm telemetry store** keeps the
+same uplinks decoded into narrow per-metric readings against a shared vocabulary — so a soil probe
+from one vendor and a soil probe from another land as interchangeable data — each stamped with the
+property the device was on when it measured. Four services, all opt-in:
+
+| Service | What it does |
+|---------|--------------|
+| `farm-postgres` | `postgres:18` + pg_partman + PostGIS, holding the `farmdata` database |
+| `farmdata-migrate` | One-shot: applies the migration chain, mints the login users, loads the property projections |
+| `telemetry-bridge` | Consumes ChirpStack's MQTT events, mirrors its device list, serves the curation API |
+| `farmdata-api` | Read-only GraphQL over the `registry` and `telemetry` schemas |
+
+### Build the images first
+
+**They are not published anywhere yet.** Three of the four are built in the
+[telemetry-bridge](https://github.com/intelligent-farming/telemetry-bridge) repository and consumed
+here by tag from your local Docker image store — this stack never builds from a sibling checkout.
+In a telemetry-bridge checkout:
+
+```sh
+npm install
+npm run images:build     # farm-postgres, telemetry-bridge, farmdata-migrate
+```
+
+Skip that and `up` fails with `pull access denied for intelligent-farming/farm-postgres`.
+
+### Run it
+
+```sh
+docker compose --profile farm up -d
+docker compose --profile farm logs -f telemetry-bridge
+
+# tearing down needs the profile too, or these are left running:
+docker compose --profile farm down
+```
+
+`farmdata-migrate` runs to completion and stays `Exited (0)`; compose re-runs it on every `up`,
+which is intended — every step is idempotent, so a second run applies no migrations and rewrites
+the same rows. If the bridge or the API report *"dependency failed to start"*, that one-shot is
+where to look: `docker compose logs farmdata-migrate`.
+
+### Querying it
+
+```sh
+curl -s http://localhost:5051/graphql -H 'content-type: application/json' \
+  -d '{"query":"{ allReadingLatests(first: 5) { nodes { deviceId metric valueNum measuredAt } } }"}'
+```
+
+GraphiQL is at http://localhost:5051/graphiql (`FARM_API_GRAPHIQL=false` turns it off) and works
+because it is served from this same origin. A browser page served from anywhere *else* gets a 403:
+this API answers no cross-origin request, by design (see the security notes). `curl` and
+server-side clients send no `Origin` and are unaffected.
+
+The useful entry points:
+
+- **`allReadings`** — every per-metric reading. The table is partitioned by month; the API exposes
+  the parent as one table and hides the partitions, so this is the whole history.
+- **`allReadingLatests`** — the newest reading per device/metric/channel. What a dashboard wants.
+- **`allSoilMonitorVs`, `allSoilMonitorLatestVs`, …** — one pair of pivot views per device category
+  (37 of them), turning the narrow rows sideways into a column per metric. Generated from the codec
+  vocabulary, so they change only when it does.
+- **`allDevices`, `allProperties`, `allDeviceAssignments`** — the registry: what exists, where it
+  is, and the history of where it has been.
+
+`sync` is deliberately not exposed — it holds export watermarks and replication bookkeeping, which
+belong to the services rather than to a client.
+
+### Curating devices
+
+A device that reports before anyone has placed it is still ingested — readings are never gated on
+curation — and lands on the seeded default property, flagged as needing attention. The curation API
+is how a person corrects that:
+
+```sh
+# what nobody has placed yet
+curl -s 'http://localhost:8092/v1/devices?needsCuration=true'
+
+# place one (actor is who is doing it; a machine actor name is refused)
+curl -s -X POST http://localhost:8092/v1/devices/<device-id>/assignment \
+  -H 'content-type: application/json' \
+  -d '{"propertyId":"<property-id>","actor":"you@example.com"}'
+```
+
+Re-sending an identical request answers `changed: false` rather than writing again. `GET /` lists
+every verb.
+
+**Two things to know before pointing anything at it.** It serves no authentication and no TLS in
+this release, which is why it is published on loopback only. And any request carrying an `Origin`
+header is refused with 403 — deliberately, since there is no auth to protect a browser caller with
+— so this is a `curl`/CLI surface, not one to call from a web page.
+
+### Where the values come from
+
+`farm/projection.json` is the bench's organization and property, and it has exactly one job beyond
+seeding: `FARM_BRIDGE_PROPERTY_ID` is left blank in `.env` and derived from this file's
+`default_property_id`, so the property the seeder writes and the property the bridge uses cannot
+drift apart. Point at a real property by editing this file, not by pasting a UUID in two places.
+
+The ChirpStack API key the inventory reconciler uses is read from `/shared/config.json` — minted by
+the provisioner at run time, so no environment variable can carry it. That is the same file
+Leftenant reads.
+
+### Partition maintenance
+
+`reading` and `ingest_event` are partitioned monthly with retention, and **nothing on this bench
+runs maintenance automatically** — the pg_partman background worker is preloaded but deliberately
+left unpointed, since aiming it at a database before the chain has installed pg_partman makes it
+fail every cycle. Premake covers the near term. To run it by hand:
+
+```sh
+docker compose exec farm-postgres psql -U farmdata_owner -d farmdata \
+  -c "SELECT partman.run_maintenance()"
+```
+
 ## Region / sub-band
 
 The active band is a single flag, **`REGION`** in `.env` (default `us915_0` — US915 channels 0-7).
@@ -667,3 +807,24 @@ Note that alert bodies contain device names and measured values. If you point a 
 at anything off-device, use `"webhookAuth": "hmac"` and HTTPS — `token` and `bearer` put a
 bearer-equivalent secret on the wire with no replay protection. Messaging providers all use HTTPS and
 their own credentials.
+
+The `farm` profile adds three more, all off unless you name the profile:
+
+- **The curation API has no authentication and no TLS**, and it writes. It is published on loopback
+  only for that reason; move that bind only behind both. It refuses any request carrying an `Origin`
+  header, which is what keeps a browser page from reaching it, not a substitute for auth.
+- **`farmdata` ships placeholder passwords** for the owner and for both minted login users. The two
+  services connect as least-privilege logins rather than the owner — the GraphQL layer holds
+  `SELECT` and nothing else, which is what makes it read-only by role rather than by convention —
+  but the passwords are still `changeme-*` until you rotate them.
+- **`farmdata-api` is read-only but not unauthenticated-safe**: it exposes every reading and every
+  device to anyone who can reach it, with GraphiQL on by default. Loopback-bound for that reason —
+  and note that a loopback bind is a guard against the LAN, not against the operator's own browser,
+  which sits on the near side of it. So, like the curation API, it refuses cross-origin browser
+  requests: a page you happen to visit cannot read your farm's telemetry off `127.0.0.1`, and cannot
+  make this run queries blind either. GraphiQL still works, because the refusal compares `Origin`
+  against `Host` rather than refusing every `Origin` outright. What it does **not** stop is DNS
+  rebinding — a page whose name resolves to this address looks same-origin to the browser, and
+  nothing here pins `Host` to an allowlist; browsers' own local-network restrictions are the
+  mitigation. Before this goes anywhere but loopback it needs all three: TLS in front, real
+  authentication in front, and `FARM_API_GRAPHIQL=false`.

@@ -13,6 +13,19 @@ with `docker build <giturl>` — not compose's `build:` git context, which break
 (docker/compose#13815). No sibling clone needed, and this stack does not depend on
 `intelligent-farming-hub`.
 
+An opt-in `farm` profile adds the normalized telemetry path beside that: `farm-postgres`
+(the `farmdata` database), a `farmdata-migrate` one-shot, `telemetry-bridge` (MQTT consumer +
+inventory reconciler + curation API), and `farmdata-api` (read-only GraphQL). It runs beside the
+event store rather than replacing it — that archives ChirpStack's event shape, this holds
+per-metric readings against a shared vocabulary — and neither reads the other.
+
+## Images built elsewhere (the second exception, alongside Leftenant)
+Three of the four `farm` services run images built in the **telemetry-bridge** repo
+(`npm run images:build`) and consumed here **by tag from the local image store**. Do not add a
+`build:` context pointing at a sibling checkout, and do not use a git-URL context — the Windows bug
+above rules the second out, and this repo's "no sibling clone needed" promise rules out the first.
+`farm-api/` is the exception that proves the rule: it is built here because it lives here.
+
 ## Project & licensing (non-negotiable)
 - Licensed GNU AGPL-3.0-or-later. The full text is in LICENSE at the repo root — never modify, move, or remove it.
 - Copyright holder is Intelligent Farming Foundation.
@@ -46,6 +59,15 @@ Do not paste the full license into source files — the header points to LICENSE
   loopback. These are bench defaults. Anything network-exposed needs real auth, TLS, and a
   rotated `CHIRPSTACK_API_SECRET`. Exposing `events-postgres` for Fivetran is opt-in via
   `EVENTS_POSTGRES_HOST_BIND` + `EVENTS_POSTGRES_WAL_LEVEL` — see the README.
+- The `farm` profile adds more of the same: the **curation API writes and has no auth and no TLS**
+  (loopback-bound for that reason; its `Origin` refusal is not a substitute for auth), `farmdata`
+  ships placeholder passwords for the owner and both minted logins, and `farmdata-api` exposes
+  every reading to anyone who can reach it with GraphiQL on by default.
+- **Login users are minted at deploy time, never by a migration.** `farmdata`'s service roles are
+  NOLOGIN group roles — privilege carriers, not accounts — so that a frozen, hash-locked committed
+  migration never holds a password. `farmdata-migrate` creates the accounts from the environment
+  and grants each membership in exactly one role. Add a consumer there, not with a hand-written
+  `CREATE ROLE`.
 
 ## Per-PR checklist
 - New files have the SPDX + copyright header

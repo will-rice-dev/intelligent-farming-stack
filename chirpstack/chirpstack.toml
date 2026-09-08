@@ -53,6 +53,20 @@
   [integration.mqtt]
     server="tcp://$MQTT_BROKER_HOST:1883/"
     json=true
+    # ChirpStack's default is 0 — fire-and-forget, with no acknowledgement and
+    # no redelivery. A subscriber that is restarting, or briefly unreachable,
+    # simply never receives what was published in that window, and nothing
+    # anywhere records that it happened.
+    #
+    # The telemetry bridge's whole delivery guarantee rests on this being 1: it
+    # acknowledges a message only once the reading is committed, so an
+    # unacknowledged one is redelivered rather than lost. At QoS 0 there is
+    # nothing to acknowledge and that guarantee is silently void.
+    #
+    # Leftenant's browser join monitor subscribes at QoS 0 and is unaffected —
+    # the effective quality is negotiated per subscription, so raising it here
+    # only ever adds delivery for subscribers that ask for it.
+    qos=1
 
   # Writes every device event (uplinks, joins, acks, tx-acks, status, location,
   # log, integration) into the standalone events-postgres DB. ChirpStack runs its
