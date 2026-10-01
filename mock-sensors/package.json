@@ -28,7 +28,7 @@
     "watch:graphql": "curl -s http://localhost:5050/graphql -H 'Content-Type: application/json' --data '{\"query\":\"{ allEventUps(orderBy: TIME_DESC, first: 10){ nodes { devEui deviceName fPort object } } }\"}'"
   },
   "dependencies": {
-    "@intelligent-farming/lorawan-codec-normalization": "^0.2.0",
+    "@intelligent-farming/lorawan-codec-normalization": "^0.2.3",
     "lora-packet": "^0.9.3",
     "mqtt": "^5.5.0",
     "pg": "^8.11.0"
