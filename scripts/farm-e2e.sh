@@ -1865,7 +1865,7 @@ echo "[farm-e2e] the bridge is ingesting again through the thawed broker"
 # is also harmless: deactivation is a flag, and every assertion here reads
 # ingest_event and reading.
 
-step "malformed data: a poison message in the middle of an offline backlog"
+step "malformed data: poison messages in the middle of an offline backlog"
 
 POISON_EUI="fe00000000000001"
 POISON_TOPIC="application/00000000-0000-4000-8000-00000000e2e1/device/${POISON_EUI}/event/up"
@@ -1883,7 +1883,34 @@ sleep "$MOCK_INTERVAL_SECONDS"
 # withholding the ack would wedge this queue forever.
 publish_app_event "$POISON_TOPIC" 'this is not json at all {'
 publish_app_event "$POISON_TOPIC" '{"hello":"world"}'
-echo "[farm-e2e] two poison messages published into the backlog"
+
+# Two more that get much further: valid JSON, a real event shape, a devEui the
+# mapper accepts -- and a key three kilobytes long. Unbounded, that key reached
+# Postgres, which refuses an index entry over 2704 bytes (SQLSTATE 54000, here
+# on registry.metric's primary key), and a refusal the same bytes earn on every
+# redelivery is the one thing the serial retry loop could never get past: the
+# farm stopped behind one message, with everything behind it waiting. Every
+# indexed key is now bounded in bytes before any statement. The metric costs
+# its one reading, and the message lands with its sibling reading and its raw
+# capture; the devEui is the envelope's own identity, so the contract refuses
+# the whole message and it is acked and counted. Random base64 rather than a
+# repeated character, because a compressible key fits the index under pglz and
+# would have proved nothing even before the bound existed.
+# 0b and 0c: 05 is the placement step's device and 06 the lifecycle join fixture,
+# and a warm run finds both already minted -- a fixture EUI has to be its own.
+OVERSIZED_METRIC_EUI="fe0000000000000b"
+OVERSIZED_DEVEUI_TOPIC_EUI="fe0000000000000c"
+OVERSIZED_KEY="$(head -c 2250 /dev/urandom | base64 | tr -d '\n=')"
+[ "${#OVERSIZED_KEY}" -gt 2704 ] \
+  || fail "the oversized key is only ${#OVERSIZED_KEY} characters -- it has to exceed the btree row limit to mean anything"
+OVERSIZED_METRIC_EVENT_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
+OVERSIZED_DEVEUI_EVENT_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
+POISON_NOW_ISO="$(node -e 'process.stdout.write(new Date().toISOString())')"
+publish_app_event "application/00000000-0000-4000-8000-00000000e2e1/device/${OVERSIZED_METRIC_EUI}/event/up" \
+  "{\"deduplicationId\":\"${OVERSIZED_METRIC_EVENT_ID}\",\"time\":\"${POISON_NOW_ISO}\",\"deviceInfo\":{\"devEui\":\"${OVERSIZED_METRIC_EUI}\",\"deviceName\":\"farm-e2e-oversized-metric\"},\"fPort\":1,\"fCnt\":1,\"object\":{\"battery\":3.6,\"${OVERSIZED_KEY}\":1}}"
+publish_app_event "application/00000000-0000-4000-8000-00000000e2e1/device/${OVERSIZED_DEVEUI_TOPIC_EUI}/event/up" \
+  "{\"deduplicationId\":\"${OVERSIZED_DEVEUI_EVENT_ID}\",\"time\":\"${POISON_NOW_ISO}\",\"deviceInfo\":{\"devEui\":\"${OVERSIZED_KEY}\",\"deviceName\":\"farm-e2e-oversized-deveui\"},\"fPort\":1,\"fCnt\":1,\"object\":{\"battery\":3.6}}"
+echo "[farm-e2e] four poison messages published into the backlog"
 
 # And more real uplinks behind them. This is the half that catches a wedge:
 # with nothing queued after the poison, a queue stuck on it would still look
@@ -1895,14 +1922,14 @@ backlog_ids="$(LC_ALL=C comm -23 <(printf '%s\n' "$required_ids") <(captured_upl
 backlog="$(id_count "$backlog_ids")"
 [ "$backlog" -gt 0 ] \
   || fail "the broker was handed nothing to hold -- no uplink was archived while the bridge was down, so this step would prove nothing"
-echo "[farm-e2e] the broker is holding ${backlog} uplink(s), with two poison messages among them"
+echo "[farm-e2e] the broker is holding ${backlog} uplink(s), with four poison messages among them"
 
 docker compose start telemetry-bridge
 # THE assertion. If either poison were left unacked it would sit at the head of
 # this session's queue being redelivered, and none of the real uplinks behind it
 # would ever arrive -- so this goes red naming them rather than timing out
 # silently.
-wait_for_capture_of "backlog drained past two poison messages (${backlog} uplink(s) queued)" \
+wait_for_capture_of "backlog drained past four poison messages (${backlog} uplink(s) queued)" \
   "$required_ids" 180
 echo "[farm-e2e] the poison did not wedge the queue — everything behind it drained"
 
@@ -1925,7 +1952,46 @@ echo "[farm-e2e] both poison messages were acked and counted: jsonParseFailures=
 poison_device="$(device_id_of "$POISON_EUI")"
 [ -z "$poison_device" ] \
   || fail "the poison messages minted a device (${poison_device}) -- garbage must be counted and discarded, not captured"
-echo "[farm-e2e] neither poison message left a row behind"
+echo "[farm-e2e] neither shapeless poison message left a row behind"
+
+# The oversized metric key: the message lands -- device, raw capture with the
+# key still in it, the sibling reading -- and the key names no metric anywhere.
+# The counter is the flattener's, by reason, so the drop is asserted by name.
+wait_for "the oversized-metric message was captured" \
+  "SELECT count(*) FROM telemetry.ingest_event WHERE source_event_id = '${OVERSIZED_METRIC_EVENT_ID}'" "-ge 1" 60
+oversized_device="$(device_id_of "$OVERSIZED_METRIC_EUI")"
+[ -n "$oversized_device" ] || fail "the oversized-metric message minted no device -- it must land, minus the one reading"
+oversized_readings="$(farm_psql "SELECT string_agg(metric, ',' ORDER BY metric) FROM telemetry.reading WHERE device_id = '${oversized_device}' AND source_event_id = '${OVERSIZED_METRIC_EVENT_ID}'")"
+[ "$oversized_readings" = "battery" ] \
+  || fail "the oversized-metric message landed readings \"${oversized_readings}\", wanted exactly the sibling 'battery'"
+oversized_capture="$(farm_psql "SELECT length(payload::text) FROM telemetry.ingest_event WHERE source_event_id = '${OVERSIZED_METRIC_EVENT_ID}'")"
+[ "$oversized_capture" -gt 2704 ] \
+  || fail "the raw capture of the oversized-metric message is ${oversized_capture} bytes -- the whole message, key included, must be kept"
+poison_oversized="$(report_field "$poison_report" '.flattenWarningsByReason["metric-path-too-long"]')"
+[ "$poison_oversized" = "1" ] \
+  || fail "expected exactly 1 metric-path-too-long in the restarted daemon, got \"$poison_oversized\" -- a key the index cannot hold must be dropped at the reading and counted by name"
+echo "[farm-e2e] the three-kilobyte metric key cost its one reading; the message landed with its sibling and its raw capture"
+
+# The oversized devEui: refused by the contract before any statement -- no
+# capture under its id, no device under the topic EUI, and no identity row
+# anywhere near that size, which is the index-level proof. messagesPoisoned
+# stays at zero: the caps are what keep the server from ever being asked.
+oversized_deveui_rows="$(farm_psql "SELECT count(*) FROM telemetry.ingest_event WHERE source_event_id = '${OVERSIZED_DEVEUI_EVENT_ID}'")"
+[ "$oversized_deveui_rows" = "0" ] \
+  || fail "a message with a three-kilobyte devEui left a raw capture -- its identity is the envelope's own key and the contract must refuse it"
+oversized_deveui_device="$(device_id_of "$OVERSIZED_DEVEUI_TOPIC_EUI")"
+[ -z "$oversized_deveui_device" ] \
+  || fail "the oversized-devEui message minted a device (${oversized_deveui_device}) under its topic EUI"
+oversized_identities="$(farm_psql "SELECT count(*) FROM registry.device_identity WHERE octet_length(id_value) > 64")"
+[ "$oversized_identities" = "0" ] \
+  || fail "${oversized_identities} identity row(s) are over the 64-byte cap -- an identity that size reached the index"
+poison_invalid="$(report_field "$poison_report" '.invalidEnvelopes')"
+[ "$poison_invalid" = "1" ] \
+  || fail "expected exactly 1 invalidEnvelopes in the restarted daemon, got \"$poison_invalid\" -- the oversized devEui must be refused by the contract and counted"
+poison_poisoned="$(report_field "$poison_report" '.messagesPoisoned')"
+[ "$poison_poisoned" = "0" ] \
+  || fail "messagesPoisoned is \"$poison_poisoned\" -- something reached the server that it refused; the caps are supposed to keep it from ever being asked"
+echo "[farm-e2e] the three-kilobyte devEui was refused by the contract and acked: invalidEnvelopes=${poison_invalid} messagesPoisoned=${poison_poisoned}"
 
 step "malformed data: timestamps a decoder should never emit"
 
@@ -2375,14 +2441,15 @@ wait_for_capture_of "uplinks captured once everything settled (archive holds ${a
 # ── cross-table invariants, over everything the run produced ──────────────────
 #
 # Every assertion up to here has been about a fixture, a device, or a set of
-# uplink ids. These four are about the database as a whole, and they are here --
+# uplink ids. These five are about the database as a whole, and they are here --
 # after the nine failures, after the bad data, with the fleet stopped and the
 # bridge drained -- because that is the only point in the run where nothing is
 # racing and there is a full run's worth of rows to be wrong about.
 #
-# Cheap, too: four queries against tables that already carry the indexes for
-# them. What they catch is the class of bug no single-table assertion can, and
-# that the resilience steps' races are exactly where it would arise.
+# Cheap, too: a handful of queries against tables that already carry the
+# indexes for them. What they catch is the class of bug no single-table
+# assertion can, and that the resilience steps' races are exactly where it
+# would arise.
 
 step "asserting the cross-table invariants"
 
@@ -2491,6 +2558,20 @@ lifecycle_final="$(farm_psql "SELECT count(*) FROM telemetry.device_event
   || fail "this run's lifecycle fixtures left ${lifecycle_final} row(s) in telemetry.device_event, wanted 4"
 lifecycle_total="$(farm_psql "SELECT count(*) FROM telemetry.device_event")"
 echo "[farm-e2e] telemetry.device_event holds ${lifecycle_total} row(s), including both lifecycle fixtures"
+
+# 5. No indexed key anywhere over its byte cap. The bridge bounds every text
+#    that lands in a btree key before it is bound -- Postgres refuses an index
+#    entry over 2704 bytes, and that refusal recurs on every redelivery, which
+#    is the poison that stops a farm -- so a row past a cap here means a path
+#    around the caps, whatever shape it took.
+over_cap="$(farm_psql "SELECT (SELECT count(*) FROM registry.metric WHERE octet_length(metric) > 256)
+  + (SELECT count(*) FROM registry.device_identity WHERE octet_length(id_value) > 64 OR octet_length(scheme) > 32)
+  + (SELECT count(*) FROM telemetry.reading WHERE octet_length(metric) > 256 OR octet_length(channel) > 128)
+  + (SELECT count(*) FROM telemetry.ingest_event
+      WHERE octet_length(source_event_id) > 256 OR octet_length(source) > 64 OR octet_length(event_type) > 64)")"
+[ "$over_cap" = "0" ] \
+  || fail "${over_cap} row(s) carry a key over its byte cap — something reached an index past the bound the bridge enforces"
+echo "[farm-e2e] no indexed key anywhere is over its byte cap"
 
 # ── the security posture the bench actually depends on ────────────────────────
 
