@@ -369,6 +369,22 @@ bridge_keepalive_seconds() {
   printf '%s' "$seconds"
 }
 
+# The actors the bridge's own writers sign placement windows with, read out of
+# the image the same way as the keepalive above and for the same reason: a
+# device is "curated" when the actor on its open window is *not* one of these,
+# and a copy kept here would keep passing after the bridge added a third
+# writer. Rendered as a SQL text-array literal, ready for `= ANY(...)`.
+bridge_machine_actors_sql() {
+  local actors
+  actors="$(docker compose run --rm --no-deps -T --entrypoint node telemetry-bridge \
+    -e 'const a = require("/app/dist/index.js").MACHINE_ACTORS; process.stdout.write(Array.isArray(a) ? a.join(",") : "")' \
+    2>/dev/null | tr -d '[:space:]')"
+  [ -n "$actors" ] \
+    || fail "the bridge image exports no MACHINE_ACTORS, so this script cannot tell a machine-placed device from a curated one"
+  case "$actors" in *"'"*) fail "a machine actor name carries a quote, which this script does not escape: $actors" ;; esac
+  printf "ARRAY['%s']::text[]" "$(printf '%s' "$actors" | sed "s/,/','/g")"
+}
+
 broker_autosave_seconds() {
   local seconds
   seconds="$(awk '/^autosave_interval[[:space:]]+[0-9]+[[:space:]]*$/ { print $2 }' mosquitto/mosquitto.conf)"
@@ -621,9 +637,21 @@ unstamped="$(farm_psql "SELECT count(*) FROM telemetry.reading WHERE property_id
 echo "[farm-e2e] every reading is property-stamped"
 
 default_property="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("farm/projection.json","utf8")).default_property_id)')"
-off_property="$(farm_psql "SELECT count(*) FROM telemetry.reading WHERE property_id <> '${default_property}'")"
-[ "$off_property" = "0" ] || fail "$off_property reading(s) are stamped with a property that is not the seeded default"
-echo "[farm-e2e] all readings are stamped with the seeded property ${default_property}"
+# Every reading off the default property must belong to a device a *person*
+# placed. Not "every reading is on the default": this script itself moves two
+# devices onto the second property further down, and a bench kept between
+# runs -- its own teardown is `down` without `-v` -- carries their readings
+# into the next run. What must never happen, warm or cold, is a reading landing
+# off the default for a device nobody has placed: that is a stamp with no
+# window behind it.
+machine_actors="$(bridge_machine_actors_sql)"
+off_property="$(farm_psql "SELECT count(*) FROM telemetry.reading r
+  WHERE r.property_id <> '${default_property}'
+    AND NOT EXISTS (SELECT 1 FROM registry.device_assignment a
+                     WHERE a.device_id = r.device_id
+                       AND NOT (a.assigned_by = ANY(${machine_actors})))")"
+[ "$off_property" = "0" ] || fail "$off_property reading(s) are stamped off the seeded default for a device no person ever placed"
+echo "[farm-e2e] every reading off ${default_property} belongs to a device a person placed"
 
 unknown_metrics="$(farm_psql "SELECT count(*) FROM telemetry.reading r WHERE NOT EXISTS (SELECT 1 FROM registry.metric m WHERE m.metric = r.metric)")"
 [ "$unknown_metrics" = "0" ] || fail "$unknown_metrics reading(s) carry a metric that is not in the dictionary"
@@ -725,12 +753,29 @@ still_listed="$(curation_get '/v1/devices?needsCuration=true' | json_field ".dev
 [ "$still_listed" = "0" ] || fail "a curated device must leave the worklist"
 echo "[farm-e2e] the curated device left the worklist"
 
+# Quiet again -- unless the bench is older than the threshold. On a kept bench
+# the fleet's other uncurated devices age past it on their own, and then the
+# alarm is right to keep firing: that is the alarm working, not the bench
+# failing. So the expected exit code is read from the database rather than
+# assumed, and the message says which case this run was.
+others_lagging="$(farm_psql "SELECT count(*) FROM registry.device d
+  LEFT JOIN registry.device_assignment a ON a.device_id = d.device_id AND upper_inf(a.valid_range)
+  WHERE d.auto_created = true AND d.active = true AND d.device_id <> '${device_id}'
+    AND d.created_at <= now() - make_interval(days => ${FARM_BRIDGE_CURATION_LAG_DAYS})
+    AND (a.assigned_by IS NULL OR a.assigned_by = ANY(${machine_actors}))")"
+expected_lag_code=0
+[ "$others_lagging" = "0" ] || expected_lag_code=2
 set +e
 docker compose run --rm --no-deps -T telemetry-bridge curation-lag >/dev/null 2>&1
 lag_code=$?
 set -e
-[ "$lag_code" = "0" ] || fail "curation-lag should exit 0 once nothing is lagging, got $lag_code"
-echo "[farm-e2e] curation-lag exits 0 — the alarm is quiet again"
+[ "$lag_code" = "$expected_lag_code" ] \
+  || fail "curation-lag should exit ${expected_lag_code} (${others_lagging} other device(s) older than ${FARM_BRIDGE_CURATION_LAG_DAYS} days still unplaced), got $lag_code"
+if [ "$others_lagging" = "0" ]; then
+  echo "[farm-e2e] curation-lag exits 0 — the alarm is quiet again"
+else
+  echo "[farm-e2e] curation-lag still exits 2 — this bench is older than ${FARM_BRIDGE_CURATION_LAG_DAYS} days and ${others_lagging} other device(s) genuinely lag; the curated one left the list"
+fi
 
 # ── partition maintenance ─────────────────────────────────────────────────────
 #
@@ -810,10 +855,35 @@ echo "[farm-e2e] the running bridge scheduled maintenance and its own run report
 horizon_gaps="$(farm_psql "SELECT count(*) FROM partman.part_config pc WHERE NOT coalesce((partman.show_partition_name(pc.parent_table, (now() + interval '45 days')::text)).table_exists, false)")"
 [ "$horizon_gaps" = "0" ] \
   || fail "${horizon_gaps} partition set(s) have no child covering traffic 45 days from now"
-default_rows="$(farm_psql "SELECT count(*) FROM partman.check_default(p_exact_count := false)")"
-[ "$default_rows" = "0" ] \
-  || fail "a default partition holds rows on this bench (${default_rows} set(s)) -- every fixture here is timestamped inside a real month, so this means one escaped"
-echo "[farm-e2e] a partition covers traffic 45 days out, and no default partition holds a row"
+# The default partitions, judged the way the bridge's own verdict judges them:
+# a row *at or past the newest child's upper bound* is the trap (it blocks the
+# very partition premake would create next, and nothing here can remove it),
+# while a row *below the oldest child* is an old backfill premake never
+# reaches backwards for -- untidy, harmless, and exactly what the kept
+# default partition exists to catch. Asking `check_default` for zero rows
+# conflated the two, and this bench has a legitimate old row: the mock GPS
+# tracker replays a frame whose own measurement time is a fixed June 2026
+# instant, which drifted below the three-month premake window the moment the
+# calendar passed September. Occupancy is a warning, never the verdict.
+stuck_rows="$(farm_psql "SELECT
+    (SELECT count(*) FROM ONLY telemetry.reading_default r
+      WHERE r.measured_at >= (
+        SELECT (partman.show_partition_info(sp.partition_schemaname || '.' || sp.partition_tablename,
+                                            pc.partition_interval, pc.parent_table)).child_end_time
+          FROM partman.part_config pc,
+               LATERAL (SELECT * FROM partman.show_partitions(pc.parent_table, 'DESC', false) LIMIT 1) sp
+         WHERE pc.parent_table = 'telemetry.reading'))
+  + (SELECT count(*) FROM ONLY telemetry.ingest_event_default e
+      WHERE e.occurred_at >= (
+        SELECT (partman.show_partition_info(sp.partition_schemaname || '.' || sp.partition_tablename,
+                                            pc.partition_interval, pc.parent_table)).child_end_time
+          FROM partman.part_config pc,
+               LATERAL (SELECT * FROM partman.show_partitions(pc.parent_table, 'DESC', false) LIMIT 1) sp
+         WHERE pc.parent_table = 'telemetry.ingest_event'))")"
+[ "$stuck_rows" = "0" ] \
+  || fail "${stuck_rows} row(s) sit in a default partition at or past the newest child's bound -- the partition set is stuck, and the bridge's own verdict should have said degraded"
+backfill_rows="$(farm_psql "SELECT (SELECT count(*) FROM ONLY telemetry.reading_default) + (SELECT count(*) FROM ONLY telemetry.ingest_event_default)")"
+echo "[farm-e2e] a partition covers traffic 45 days out, and no default partition holds a row the set would need back (${backfill_rows} old backfill row(s) below the oldest child, which is what the default is for)"
 
 # ── property stamping across a placement change ───────────────────────────────
 #
@@ -865,15 +935,25 @@ echo "[farm-e2e] both properties are seeded; moving a device onto ${south_proper
 #
 # Deliberately not the device the curation step above placed: failure 7 asserts
 # that device's operator-written window survived a power cycle, and moving it
-# here would be asserting two different things about one row.
+# here would be asserting two different things about one row. And deliberately
+# a device no person has *ever* placed: the split asserted at the end says
+# every reading before the move is on the default, which is only true of a
+# device whose whole history is machine-written. A kept bench has a few of
+# this run's predecessors' moved devices in the fleet, and this skips them --
+# each run uses up two of the fleet's devices, so a bench rerun a dozen times
+# does run out, and says so rather than failing a step about something else.
 moved_device="$(farm_psql "SELECT d.device_id FROM registry.device d
    JOIN registry.device_identity i ON i.device_id = d.device_id AND i.scheme = 'dev_eui'
   WHERE d.auto_created = true
     AND d.device_id <> '${device_id}'
     AND EXISTS (SELECT 1 FROM telemetry.reading r WHERE r.device_id = d.device_id)
+    AND NOT EXISTS (SELECT 1 FROM registry.device_assignment a
+                     WHERE a.device_id = d.device_id
+                       AND NOT (a.assigned_by = ANY(${machine_actors})))
   ORDER BY i.id_value
   LIMIT 1")"
-[ -n "$moved_device" ] || fail "no second reporting device to move -- the fleet should have provided one"
+[ -n "$moved_device" ] \
+  || fail "no never-placed reporting device left to move -- a kept bench has used the fleet up; start over with: docker compose --profile farm --profile mock down -v"
 
 pre_move_readings="$(farm_psql "SELECT count(*) FROM telemetry.reading WHERE device_id = '${moved_device}'")"
 [ "$pre_move_readings" -gt 0 ] || fail "the device chosen to move has no readings yet, so a split cannot be observed"
@@ -935,20 +1015,37 @@ placement_device="$(device_id_of "$PLACEMENT_EUI")"
 # the same reason the bridge repo's own placement exercise waits here.
 sleep 1
 
+# Which way to move it is read from the bench rather than assumed. On a fresh
+# bench the fixture sits where auto-registration put it, the default, and
+# moves south; on a kept bench the previous run left it south, and it moves
+# back. Either way one message straddles a real move between two different
+# properties, which is the whole of what this half asserts.
+fixture_from="$(farm_psql "SELECT property_id FROM registry.device_assignment
+  WHERE device_id = '${placement_device}' AND upper_inf(valid_range)")"
+[ -n "$fixture_from" ] || fail "the placement fixture has no open placement window"
+if [ "$fixture_from" = "$south_property" ]; then
+  fixture_to="$default_property"
+else
+  fixture_to="$south_property"
+fi
+
 fixture_move="$(curation_post "/v1/devices/${placement_device}/assignment" \
-  "{\"propertyId\":\"${south_property}\",\"actor\":\"farm-e2e-operator\"}")"
+  "{\"propertyId\":\"${fixture_to}\",\"actor\":\"farm-e2e-operator\"}")"
 [ "$(printf '%s' "$fixture_move" | json_field '.changed')" = "true" ] \
   || fail "moving the placement fixture must write: $fixture_move"
 
 # The midpoint of the window the move just closed, computed by the database so
 # it is expressed in the same clock the bounds are. This is the instant the
 # history entry below claims to have measured at, and it must resolve to the
-# *default* property even though the device now sits on the south field.
+# property the device was on *before* the move even though it now sits on the
+# other one. The newest closed window, specifically: on a kept bench the
+# fixture's history holds one per run.
 fixture_window="$(farm_psql "SELECT to_char(
      (lower(valid_range) + (upper(valid_range) - lower(valid_range)) / 2) AT TIME ZONE 'UTC',
      'YYYY-MM-DD\"T\"HH24:MI:SS.MSZ')
    FROM registry.device_assignment
-  WHERE device_id = '${placement_device}' AND NOT upper_inf(valid_range)")"
+  WHERE device_id = '${placement_device}' AND NOT upper_inf(valid_range)
+  ORDER BY upper(valid_range) DESC LIMIT 1")"
 [ -n "$fixture_window" ] || fail "the placement fixture's move closed no window"
 
 # THE assertion this step exists for. One message: its top-level reading is
@@ -970,16 +1067,16 @@ straddle_rows="$(farm_psql "SELECT count(*) FROM telemetry.reading
 
 historical_property="$(farm_psql "SELECT property_id FROM telemetry.reading
   WHERE device_id = '${placement_device}' AND measured_at = '${fixture_window}'::timestamptz")"
-[ "$historical_property" = "$default_property" ] \
-  || fail "the history entry measured before the move is stamped ${historical_property}, not the property that was valid then (${default_property})"
+[ "$historical_property" = "$fixture_from" ] \
+  || fail "the history entry measured before the move is stamped ${historical_property}, not the property that was valid then (${fixture_from})"
 
 current_property="$(farm_psql "SELECT property_id FROM telemetry.reading
   WHERE device_id = '${placement_device}' AND source_event_id = '${PLACEMENT_STRADDLE_ID}'
     AND measured_at <> '${fixture_window}'::timestamptz")"
-[ "$current_property" = "$south_property" ] \
-  || fail "the reading measured after the move is stamped ${current_property}, not ${south_property}"
+[ "$current_property" = "$fixture_to" ] \
+  || fail "the reading measured after the move is stamped ${current_property}, not ${fixture_to}"
 
-echo "[farm-e2e] one message, two properties — the history entry kept ${default_property}, the live reading took ${south_property}"
+echo "[farm-e2e] one message, two properties — the history entry kept ${fixture_from}, the live reading took ${fixture_to}"
 
 # ── resilience, against the real containerized daemon ─────────────────────────
 #
@@ -1833,22 +1930,39 @@ ts_before="$(bridge_report "before the bad-timestamp fixtures")"
 
 TS_FUTURE_EUI="fe00000000000002"
 TS_PAST_EUI="fe00000000000003"
+TS_SKEW_EUI="fe00000000000009"
 FUTURE_EVENT_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
 HISTORY_EVENT_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
+SKEW_EVENT_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
 NOW_ISO="$(node -e 'process.stdout.write(new Date().toISOString())')"
-FUTURE_ISO="$(node -e 'process.stdout.write(new Date(Date.now() + 10 * 60 * 1000).toISOString())')"
+FUTURE_ISO="$(node -e 'process.stdout.write(new Date(Date.now() + 25 * 3600 * 1000).toISOString())')"
+SKEW_ISO="$(node -e 'process.stdout.write(new Date(Date.now() + 10 * 60 * 1000).toISOString())')"
 ANCIENT_ISO="$(node -e 'process.stdout.write(new Date(Date.now() - 4 * 365 * 24 * 3600 * 1000).toISOString())')"
 
-# A whole message ten minutes ahead. `occurred_at` is a *delivery* time and the
-# raw table's partition key, so it has no legitimate reason to sit far from now:
-# a row landing beyond the premade partitions goes to the kept default
+# A whole message a day and an hour ahead. `occurred_at` is a *delivery* time
+# and the raw table's partition key, so it has no legitimate reason to sit far
+# from now: a row landing beyond the premade partitions goes to the kept default
 # partition, and a default partition holding a row for a month refuses to give
 # that month up -- creating the partition later fails, maintenance stalls, and
 # the bridge's role holds no DELETE to clean it up. One discarded message with
 # an impossible clock is much the cheaper loss, so the message is dropped whole:
 # no reading, and no raw capture either.
+#
+# A day, not minutes, because the bound is sized to the partition horizon
+# (three months premade) and not to a clock's expected drift: ChirpStack
+# stamps uplinks with gateway GPS time whenever the gateway has it, so a box
+# whose own clock runs a few minutes slow sees every message arrive "from the
+# future" by that much -- and under a five-minute bound dropped all of them.
 publish_app_event "application/00000000-0000-4000-8000-00000000e2e1/device/${TS_FUTURE_EUI}/event/up" \
   "{\"deduplicationId\":\"${FUTURE_EVENT_ID}\",\"time\":\"${FUTURE_ISO}\",\"deviceInfo\":{\"devEui\":\"${TS_FUTURE_EUI}\",\"deviceName\":\"farm-e2e-future-clock\"},\"fPort\":1,\"fCnt\":1,\"object\":{\"battery\":3.7}}"
+
+# And the case that bound exists to let through: a message ten minutes ahead,
+# which is what a GPS-stamped uplink looks like to a box ten minutes slow. It
+# must land -- raw capture, device, reading -- and the skew must be reported,
+# because a box drifting toward the bound should be fixed long before it gets
+# there, and a counter of dropped messages reads zero right up until then.
+publish_app_event "application/00000000-0000-4000-8000-00000000e2e1/device/${TS_SKEW_EUI}/event/up" \
+  "{\"deduplicationId\":\"${SKEW_EVENT_ID}\",\"time\":\"${SKEW_ISO}\",\"deviceInfo\":{\"devEui\":\"${TS_SKEW_EUI}\",\"deviceName\":\"farm-e2e-slow-box-clock\"},\"fPort\":1,\"fCnt\":1,\"object\":{\"battery\":3.7}}"
 
 # And a message whose own delivery time is fine but which carries one ancient
 # reading. This has to come through history[] rather than the event's own time:
@@ -1868,7 +1982,16 @@ wait_for "the ancient-history message was captured" \
 
 future_rows="$(farm_psql "SELECT count(*) FROM telemetry.ingest_event WHERE source_event_id = '${FUTURE_EVENT_ID}'")"
 [ "$future_rows" = "0" ] \
-  || fail "a message timestamped 10 minutes in the future left a raw capture -- it must be dropped whole, or its occurred_at parks a row in the default partition that nothing here can remove"
+  || fail "a message timestamped 25 hours in the future left a raw capture -- it must be dropped whole, or its occurred_at parks a row in the default partition that nothing here can remove"
+
+skew_rows="$(farm_psql "SELECT count(*) FROM telemetry.ingest_event WHERE source_event_id = '${SKEW_EVENT_ID}'")"
+[ "$skew_rows" = "1" ] \
+  || fail "a message ten minutes ahead of the box clock was not captured -- a GPS-stamped uplink against a slow box must land, not be dropped"
+skew_device="$(device_id_of "$TS_SKEW_EUI")"
+[ -n "$skew_device" ] || fail "the ten-minutes-ahead message minted no device"
+skew_readings="$(farm_psql "SELECT count(*) FROM telemetry.reading WHERE device_id = '${skew_device}' AND source_event_id = '${SKEW_EVENT_ID}'")"
+[ "$skew_readings" -ge 1 ] || fail "the ten-minutes-ahead message landed no reading"
+echo "[farm-e2e] a message ten minutes ahead of the box clock landed — a slow box clock does not cost uplinks"
 # The message is refused before device resolution, so there is no device to
 # hang a reading on -- which is itself the assertion.
 future_device="$(device_id_of "$TS_FUTURE_EUI")"
@@ -1896,6 +2019,15 @@ assert_counter "the future-clock message" "$ts_before" "$ts_after" '.writer.enve
 # *as a reading*. Asserting 1 here would be asserting that the whole-message
 # drop is silent in this counter, which is exactly what it must not be.
 assert_counter "the two bad timestamps" "$ts_before" "$ts_after" '.writer.readingsSkippedBadTimestamp' 2
+# The skew observable: the largest lead any timestamp had over the box clock,
+# a high-water mark rather than a count, so it is read absolutely rather than
+# as a delta. The 25-hour message was measured before it was dropped, so the
+# mark is at least that; what matters operationally is that a ten-minute lead
+# would already have shown up here before it ever cost a message.
+skew_reported="$(report_field "$ts_after" '.writer.maxFutureSkewMs')"
+[ -n "$skew_reported" ] && [ "$skew_reported" -ge 600000 ] \
+  || fail "the ingest report carries maxFutureSkewMs=${skew_reported:-<missing>}, wanted at least 600000 after a message ten minutes ahead"
+echo "[farm-e2e] the report shows the clock skew it saw: maxFutureSkewMs=${skew_reported}"
 
 step "malformed data: a redelivery that can actually be seen"
 
@@ -2098,9 +2230,14 @@ publish_app_event "$PLACEMENT_TOPIC" \
 wait_for "the redeliveries were processed" \
   "SELECT count(*) FROM telemetry.ingest_event WHERE source_event_id = '${LIFECYCLE_FENCE_ID}'" "-ge 1" 60
 
-lifecycle_rows="$(farm_psql "SELECT count(*) FROM telemetry.device_event WHERE device_id IN ('${join_device}', '${status_device}')")"
+# Counted by this run's own event ids rather than by device: the fixture
+# devices are the same every run, so on a kept bench their rows accumulate one
+# pair per run, and a count by device would read a healthy second run as a
+# dedupe failure. The ids are fresh each run, and a redelivery reuses them --
+# which is exactly the key the dedupe is on.
+lifecycle_rows="$(farm_psql "SELECT count(*) FROM telemetry.device_event WHERE source_event_id IN ('${JOIN_EVENT_ID}', '${STATUS_EVENT_ID}')")"
 [ "$lifecycle_rows" = "2" ] \
-  || fail "after redelivering both events the lifecycle table holds ${lifecycle_rows} row(s), wanted 2 — the conflict key is not deduping"
+  || fail "after redelivering both events the lifecycle table holds ${lifecycle_rows} row(s) for them, wanted 2 — the conflict key is not deduping"
 echo "[farm-e2e] both events redelivered and neither duplicated — the lifecycle key dedupes"
 
 step "stopping the mock fleet"
@@ -2238,14 +2375,15 @@ post_move_count="$(farm_psql "SELECT count(*) FROM telemetry.reading
   || fail "the moved device reported nothing after the move, so the split above proves only half of itself"
 echo "[farm-e2e] the moved device: ${pre_move_readings}+ reading(s) still on ${default_property}, ${post_move_count} on ${south_property}"
 
-# 4. The lifecycle table. Asserted by device rather than by a global count:
-#    this bench's fleet is ABP and requests no status, so the only rows here
-#    are the fixtures -- but an OTAA fleet or a status interval would add
-#    real ones, and that should not turn this red.
+# 4. The lifecycle table. Asserted by this run's event ids rather than by a
+#    global count or by device: this bench's fleet is ABP and requests no
+#    status, so the only rows here are the fixtures -- but an OTAA fleet or a
+#    status interval would add real ones, and a kept bench holds every earlier
+#    run's fixtures too, and neither should turn this red.
 lifecycle_final="$(farm_psql "SELECT count(*) FROM telemetry.device_event
-   WHERE device_id IN ('${join_device}', '${status_device}', '${mains_device}')")"
+   WHERE source_event_id IN ('${JOIN_EVENT_ID}', '${STATUS_EVENT_ID}', '${MAINS_EVENT_ID}')")"
 [ "$lifecycle_final" = "3" ] \
-  || fail "the lifecycle fixtures left ${lifecycle_final} row(s) in telemetry.device_event, wanted 3"
+  || fail "this run's lifecycle fixtures left ${lifecycle_final} row(s) in telemetry.device_event, wanted 3"
 lifecycle_total="$(farm_psql "SELECT count(*) FROM telemetry.device_event")"
 echo "[farm-e2e] telemetry.device_event holds ${lifecycle_total} row(s), including both lifecycle fixtures"
 

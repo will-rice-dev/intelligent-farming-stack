@@ -702,6 +702,18 @@ bash scripts/farm-e2e.sh              # tears the stack down afterwards
 FARM_E2E_KEEP=1 bash scripts/farm-e2e.sh   # leave it running (fast iteration)
 ```
 
+It passes on a kept bench as well as a fresh one. Its own teardown is `down` without `-v`, so every
+second run is a warm run against the data the last one left, and the assertions are written for
+that: readings off the default property must belong to a device a person placed (rather than "every
+reading is on the default"), the placement step picks a fleet device nobody has ever placed and
+moves the synthetic fixture whichever way it is not currently facing, lifecycle rows are counted by
+the run's own event ids, and the curation-lag check reads its expected exit code from the database —
+on a bench older than `FARM_BRIDGE_CURATION_LAG_DAYS` the fleet's other unplaced devices genuinely
+lag, and the alarm is right to keep firing. Each run uses up two of the fleet's devices for its
+placement steps, so a bench rerun a dozen times does run out of never-placed devices, and says so
+with the `down -v` to start over. What stays red for good once it has happened is a lost uplink: the
+whole-archive comparison is deliberately permanent, and only `down -v` clears it.
+
 It takes around twenty-five minutes, most of it waiting on uplink rounds, on containers
 stopping and starting, on the one checkpoint interval the killed-broker step sits through, on the
 bridge's own 30s write deadline expiring under the frozen database, and on

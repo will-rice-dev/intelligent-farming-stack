@@ -611,6 +611,14 @@ services:
     profiles: ["farm"]
     image: ${TELEMETRY_BRIDGE_IMAGE:-intelligent-farming/telemetry-bridge:dev}
     restart: unless-stopped
+    # How long compose waits between SIGTERM and SIGKILL. Derived from the
+    # daemon's own bounds rather than guessed: a write in flight gets a 5s
+    # shutdown grace, the broker close 5s, the database close up to 10s, and
+    # the final log flush 2s -- about 22s with every peer frozen at once.
+    # Compose's default 10s is shorter than two of those together, and what
+    # SIGKILL discards is the shutdown's ingest report, which farm-e2e.sh
+    # scrapes. Same value, same arithmetic, as the bridge repo's own compose.
+    stop_grace_period: 30s
     # Wrapped, because the ChirpStack API key does not exist until the
     # provisioner has minted it and is written only to the shared volume — no
     # environment variable can carry it. The shim reads it, derives the default
