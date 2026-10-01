@@ -518,7 +518,11 @@ inside the closed window and whose own reading is measured now lands **two readi
 properties from one batch**, which is the whole of what "as of measurement time" means. It also
 publishes a `join` and a `status` event so `telemetry.device_event` is exercised, and redelivers
 both to prove the lifecycle key dedupes — those are fixtures because they have to be: the mock fleet
-is ABP-activated and requests no device status, so ChirpStack publishes neither event for it. It then
+is ABP-activated and requests no device status, so ChirpStack publishes neither event for it. A
+further fixture is the pair ChirpStack _does_ publish for a device answering a status request — a
+`status` and an `up` minted from one frame, sharing one `deduplicationId` and one `time` — which must
+land as two raw captures with both payloads intact, neither counted as a replay, and count exactly
+two replays when both are redelivered; the raw table is keyed per event type for exactly that. It then
 puts the path under the nine failures it has to survive — the
 database stopped underneath it, the bridge stopped while the broker keeps receiving, the bridge
 killed outright, then the broker itself restarted under a live bridge, restarted with a backlog
@@ -741,8 +745,9 @@ and every later run against a kept bench. The bridge's fixtures are reserved dev
 at the start of each run, so it can afford to destroy a session and assert what that costs.
 
 That in-process form is also the only place a redelivery can be **observed**. Every trace of one is
-collapsed by a primary key — `reading`, `reading_latest`, `ingest_event` and `device_event` all
-dedupe on conflict — and the daemon logs connection lifecycle, faults and shutdown but never its
+collapsed by a primary key — `reading`, `reading_latest`, `ingest_event` (per event type, since one
+frame yields several events) and `device_event` all dedupe on conflict — and the daemon logs
+connection lifecycle, faults and shutdown but never its
 counters, so from out here a replay that was deduped and a redelivery that never happened are
 indistinguishable. Successful idempotence is silent by construction. What this script can prove
 after the kill is that ingestion resumed and nothing was lost; that the replay wrote nothing twice
