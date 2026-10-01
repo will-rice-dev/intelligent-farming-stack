@@ -673,12 +673,23 @@ this bench never saw. Four steps, and the first is why the section exists: the b
 acknowledges a message only after committing it, so a message it fails to ack stays at the head of
 the broker's queue and is redelivered forever with everything behind it waiting. A poison message
 that is not acked therefore does not lose one reading — it stops the farm, silently, until somebody
-notices. So garbage is published into the middle of an offline backlog, real uplinks on both sides
-of it, and the whole backlog has to drain past it. Then timestamps a decoder should never emit: a
-message ten minutes in the future, which is dropped **whole** because `occurred_at` is the raw
-table's partition key and a row in the kept default partition blocks that month's partition from
-ever being created; and an ancient reading inside a `history[]` entry, where the blast radius is
-deliberately different — that reading is dropped and the raw capture is kept. Then a redelivery,
+notices. So four kinds of garbage are published into the middle of an offline backlog, real uplinks
+on both sides of them, and the whole backlog has to drain past them: bytes that are not JSON, JSON
+that is not a ChirpStack event, and — the two that would actually have wedged it — a decoded object
+carrying a three-kilobyte metric key, and an event whose `devEui` is three kilobytes long.
+Unbounded, either reached Postgres, which refuses an index entry over 2704 bytes, and a refusal the
+same bytes earn on every redelivery held the queue forever; the bridge now bounds every indexed key
+in bytes before any statement, so the metric costs its one reading (the message lands with its
+sibling reading and its raw capture) and the oversized identity costs the message (refused by the
+contract, acked, counted). A refusal the database does send is classified by its SQLSTATE class — a
+message's own fault is acked and counted in `messagesPoisoned`, a deployment's fault is retried and
+announced — and the step asserts that counter stayed at zero, since nothing is supposed to reach
+the server that it could refuse. Then timestamps a decoder should never emit: a message
+twenty-five hours in the future, which is dropped **whole** because `occurred_at` is the raw table's
+partition key and a row in the kept default partition blocks that month's partition from ever being
+created — while one ten minutes ahead, which is what a GPS-stamped uplink looks like to a slow box,
+must land; and an ancient reading inside a `history[]` entry, where the blast radius is deliberately
+different — that reading is dropped and the raw capture is kept. Then a redelivery,
 published twice on purpose. And last, a device whose ChirpStack codec throws on every uplink, whose
 raw capture has to land with **no decoded readings**, because ingestion is never gated on decode.
 Not *zero* readings: the adapter mints `gatewayRssi`/`gatewaySnr` from the uplink's `rxInfo`
