@@ -397,6 +397,10 @@ broker_autosave_seconds() {
 # message identity, which is what makes a per-message comparison possible at
 # all: event_up's primary key is ChirpStack's deduplicationId, and that is
 # exactly what the bridge records as telemetry.ingest_event.source_event_id.
+# It names the *frame*, not the event -- ChirpStack stamps every event it mints
+# from one uplink (the up, a status report, an ack) with the same id and time,
+# and the bridge keeps each as its own raw row, keyed apart by event_type --
+# which is why the capture side below filters to 'up'.
 archived_uplink_ids() {
   events_psql "SELECT lower(deduplication_id::text) FROM event_up" | LC_ALL=C sort
 }
@@ -2143,6 +2147,12 @@ echo "[farm-e2e] every uplink it sent reached farmdata, decoded or not"
 # NOTHING, so a redelivery must add nothing. That is asserted here rather than
 # inferred, because from outside the process a redelivery that was deduped and
 # one that never happened leave identical rows.
+#
+# The last fixture in this section is the one shape the fleet can never produce
+# and the one ChirpStack always does for a device answering a status request: a
+# `status` and an `up` minted from a single frame, sharing one deduplicationId
+# and one time. Those are two raw captures, not a replay of one another, and
+# the raw key has to tell them apart.
 
 step "device lifecycle events through the packaged daemon"
 
@@ -2239,6 +2249,100 @@ lifecycle_rows="$(farm_psql "SELECT count(*) FROM telemetry.device_event WHERE s
 [ "$lifecycle_rows" = "2" ] \
   || fail "after redelivering both events the lifecycle table holds ${lifecycle_rows} row(s) for them, wanted 2 — the conflict key is not deduping"
 echo "[farm-e2e] both events redelivered and neither duplicated — the lifecycle key dedupes"
+
+# ── one frame, two events ─────────────────────────────────────────────────────
+#
+# ChirpStack mints a device's status report from the same uplink frame as the
+# up event, stamps both with the frame's deduplicationId and receive time, and
+# hands them to its integrations concurrently -- the status usually first. The
+# raw table keys per event type for exactly this: under a key of (source, id,
+# time) alone the second to arrive conflicted with the first, was counted in
+# envelopesReplayed, and its payload -- usually the decoded uplink -- was never
+# stored. The fleet cannot produce the shape (ABP, no status interval), and the
+# status fixture above has an id of its own, so only this fixture carries the
+# real wire shape. Status first, since that is the order ChirpStack usually
+# wins the race in; the bridge repo's adapter exercise covers both.
+
+step "one frame, two events: a status and an up sharing deduplicationId and time"
+
+PAIR_EUI="fe0000000000000a"
+PAIR_EVENT_ID="$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
+PAIR_ISO="$(node -e 'process.stdout.write(new Date().toISOString())')"
+pair_status_topic="application/00000000-0000-4000-8000-00000000e2e1/device/${PAIR_EUI}/event/status"
+pair_up_topic="application/00000000-0000-4000-8000-00000000e2e1/device/${PAIR_EUI}/event/up"
+# The up's object deliberately carries neither batteryPercent nor linkMargin:
+# those are the status report's readings at the same instant, and a codec that
+# emits them collides on reading's own key by design -- a different fact from
+# the one under test here.
+pair_status_payload="{\"deduplicationId\":\"${PAIR_EVENT_ID}\",\"time\":\"${PAIR_ISO}\",\"deviceInfo\":{\"devEui\":\"${PAIR_EUI}\",\"deviceName\":\"farm-e2e-pair\"},\"margin\":9,\"externalPowerSource\":false,\"batteryLevelUnavailable\":false,\"batteryLevel\":55}"
+pair_up_payload="{\"deduplicationId\":\"${PAIR_EVENT_ID}\",\"time\":\"${PAIR_ISO}\",\"deviceInfo\":{\"devEui\":\"${PAIR_EUI}\",\"deviceName\":\"farm-e2e-pair\"},\"fPort\":1,\"fCnt\":1,\"object\":{\"battery\":3.8}}"
+
+pair_before="$(bridge_report "before the paired frame")"
+publish_app_event "$pair_status_topic" "$pair_status_payload"
+publish_app_event "$pair_up_topic" "$pair_up_payload"
+
+# Two rows for one id is the whole claim; under the old key this wait never
+# reached 2.
+wait_for "both captures of one frame landed" \
+  "SELECT count(*) FROM telemetry.ingest_event WHERE source_event_id = '${PAIR_EVENT_ID}'" \
+  "-ge 2" 60
+
+pair_types="$(farm_psql "SELECT string_agg(event_type, ',' ORDER BY event_type) FROM telemetry.ingest_event WHERE source_event_id = '${PAIR_EVENT_ID}'")"
+[ "$pair_types" = "status,up" ] \
+  || fail "one frame's two events landed as \"${pair_types}\", wanted status,up"
+# The payloads, not just the rows: a capture that landed with the wrong body
+# would satisfy the count. The up's is the one the old key lost.
+pair_up_battery="$(farm_psql "SELECT payload -> 'object' ->> 'battery' FROM telemetry.ingest_event WHERE source_event_id = '${PAIR_EVENT_ID}' AND event_type = 'up'")"
+[ "$pair_up_battery" = "3.8" ] \
+  || fail "the up capture of the paired frame carries object.battery \"${pair_up_battery}\", not 3.8 -- the decoded uplink's payload did not survive"
+pair_status_margin="$(farm_psql "SELECT payload ->> 'margin' FROM telemetry.ingest_event WHERE source_event_id = '${PAIR_EVENT_ID}' AND event_type = 'status'")"
+[ "$pair_status_margin" = "9" ] \
+  || fail "the status capture of the paired frame carries margin \"${pair_status_margin}\", not 9"
+
+# The counter half: neither event is a replay of the other. The rows above are
+# the load-bearing assertion; this is what keeps envelopesReplayed honest, since
+# under the old key it rose here on a message nothing had redelivered.
+pair_after="$(bridge_report "after the paired frame")"
+assert_counter "a status and an up from one frame" "$pair_before" "$pair_after" '.writer.envelopesReplayed' 0
+
+pair_device="$(device_id_of "$PAIR_EUI")"
+[ -n "$pair_device" ] || fail "the paired frame minted no device"
+# Keyed on the frame's own instant, never the device: the fixture device is the
+# same every run, and on a kept bench it carries one frame's readings per run.
+pair_metrics="$(farm_psql "SELECT string_agg(DISTINCT metric, ',' ORDER BY metric)
+  FROM telemetry.reading WHERE device_id = '${pair_device}' AND measured_at = '${PAIR_ISO}'::timestamptz")"
+[ "$pair_metrics" = "battery,batteryPercent,linkMargin" ] \
+  || fail "the paired frame minted metrics \"${pair_metrics}\" at its instant, wanted battery,batteryPercent,linkMargin -- both events' readings must land"
+pair_events="$(farm_psql "SELECT string_agg(event_type, ',') FROM telemetry.device_event WHERE source_event_id = '${PAIR_EVENT_ID}'")"
+[ "$pair_events" = "status" ] \
+  || fail "the paired frame left lifecycle rows \"${pair_events}\", wanted exactly one status row"
+echo "[farm-e2e] one frame, two events: both captured with their payloads, neither counted as a replay"
+
+# And a true redelivery of both is still exactly two replays -- the counter
+# has to rise on what was actually redelivered, no more and no less.
+publish_app_event "$pair_status_topic" "$pair_status_payload"
+publish_app_event "$pair_up_topic" "$pair_up_payload"
+pair_deadline=$(( $(date +%s) + 60 ))
+while :; do
+  pair_replayed_report="$(bridge_report "after redelivering the paired frame")"
+  pair_replayed=$(( $(report_field "$pair_replayed_report" '.writer.envelopesReplayed') - $(report_field "$pair_after" '.writer.envelopesReplayed') ))
+  [ "$pair_replayed" -lt 2 ] || break
+  [ "$(date +%s)" -lt "$pair_deadline" ] \
+    || fail "redelivering both events of the paired frame was counted as ${pair_replayed} replay(s) within 60s, wanted 2"
+  sleep 2
+done
+[ "$pair_replayed" = "2" ] \
+  || fail "redelivering both events of the paired frame counted ${pair_replayed} replays, wanted exactly 2"
+pair_rows_after="$(farm_psql "SELECT count(*) FROM telemetry.ingest_event WHERE source_event_id = '${PAIR_EVENT_ID}'")"
+[ "$pair_rows_after" = "2" ] \
+  || fail "after redelivering the paired frame it holds ${pair_rows_after} raw captures, not 2"
+pair_readings_after="$(farm_psql "SELECT count(*) FROM telemetry.reading WHERE device_id = '${pair_device}' AND measured_at = '${PAIR_ISO}'::timestamptz")"
+[ "$pair_readings_after" = "3" ] \
+  || fail "after redelivering the paired frame it holds ${pair_readings_after} reading(s) at its instant, not 3"
+pair_events_after="$(farm_psql "SELECT count(*) FROM telemetry.device_event WHERE source_event_id = '${PAIR_EVENT_ID}'")"
+[ "$pair_events_after" = "1" ] \
+  || fail "after redelivering the paired frame it holds ${pair_events_after} lifecycle row(s), not 1"
+echo "[farm-e2e] the paired frame redelivered: envelopesReplayed +${pair_replayed}, and nothing landed twice"
 
 step "stopping the mock fleet"
 docker compose --profile mock stop mock-sensors
@@ -2379,11 +2483,12 @@ echo "[farm-e2e] the moved device: ${pre_move_readings}+ reading(s) still on ${d
 #    global count or by device: this bench's fleet is ABP and requests no
 #    status, so the only rows here are the fixtures -- but an OTAA fleet or a
 #    status interval would add real ones, and a kept bench holds every earlier
-#    run's fixtures too, and neither should turn this red.
+#    run's fixtures too, and neither should turn this red. Four: the join, the
+#    status, the mains status, and the status half of the paired frame.
 lifecycle_final="$(farm_psql "SELECT count(*) FROM telemetry.device_event
-   WHERE source_event_id IN ('${JOIN_EVENT_ID}', '${STATUS_EVENT_ID}', '${MAINS_EVENT_ID}')")"
-[ "$lifecycle_final" = "3" ] \
-  || fail "this run's lifecycle fixtures left ${lifecycle_final} row(s) in telemetry.device_event, wanted 3"
+   WHERE source_event_id IN ('${JOIN_EVENT_ID}', '${STATUS_EVENT_ID}', '${MAINS_EVENT_ID}', '${PAIR_EVENT_ID}')")"
+[ "$lifecycle_final" = "4" ] \
+  || fail "this run's lifecycle fixtures left ${lifecycle_final} row(s) in telemetry.device_event, wanted 4"
 lifecycle_total="$(farm_psql "SELECT count(*) FROM telemetry.device_event")"
 echo "[farm-e2e] telemetry.device_event holds ${lifecycle_total} row(s), including both lifecycle fixtures"
 
