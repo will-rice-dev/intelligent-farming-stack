@@ -11,7 +11,9 @@
 # then handed to the REST-based tooling (Leftenant, attach-codecs.py).
 #
 # After ChirpStack is up it:
-#   1. logs in over gRPC as the bootstrap admin,
+#   1. logs in over gRPC as the bootstrap admin, first rotating the password
+#      ChirpStack seeded it with (admin) to CHIRPSTACK_ADMIN_PASSWORD when that
+#      is set to anything else,
 #   2. ensures an "Intelligent Farming" tenant exists,
 #   3. mints a tenant-scoped API key (once; reused on later runs),
 #   4. writes the connection artifacts the rest of the stack consumes:
@@ -31,11 +33,15 @@ from urllib.parse import urlparse
 
 import grpc
 from chirpstack_api import api
+from google.protobuf import empty_pb2
 
 # ── Config (from the environment; see docker-compose.yml) ────────────────────
 GRPC_TARGET = os.environ.get("CHIRPSTACK_GRPC", "chirpstack:8080")
 ADMIN_EMAIL = os.environ.get("CHIRPSTACK_ADMIN_EMAIL", "admin")
 ADMIN_PASSWORD = os.environ.get("CHIRPSTACK_ADMIN_PASSWORD", "admin")
+# The password ChirpStack seeds its admin user with on first boot. When
+# CHIRPSTACK_ADMIN_PASSWORD is anything else, the seeded one is rotated away.
+ADMIN_INITIAL_PASSWORD = os.environ.get("CHIRPSTACK_ADMIN_INITIAL_PASSWORD", "admin")
 TENANT_NAME = os.environ.get("TENANT_NAME", "Intelligent Farming")
 API_KEY_NAME = os.environ.get("API_KEY_NAME", "intelligent-farming-stack")
 
@@ -68,20 +74,59 @@ CODECS_DIR = Path(os.environ.get("CODECS_DIR", "/codecs"))
 LOGIN_RETRIES = int(os.environ.get("LOGIN_RETRIES", "60"))
 
 
+def login(internal, password):
+    """The admin's JWT for this password ("" if ChirpStack returned none), or
+    None when ChirpStack refuses the password. Any other failure, such as
+    ChirpStack not listening yet, is raised for the caller to retry."""
+    try:
+        return internal.Login(api.LoginRequest(email=ADMIN_EMAIL, password=password)).jwt
+    except grpc.RpcError as err:
+        if err.code() == grpc.StatusCode.UNAUTHENTICATED:
+            return None
+        raise
+
+
+def rotate_initial_password(channel, internal, jwt):
+    """Set the admin's password, signed in with the seeded one, to ADMIN_PASSWORD."""
+    auth = [("authorization", f"Bearer {jwt}")]
+    user_id = internal.Profile(empty_pb2.Empty(), metadata=auth).user.id
+    api.UserServiceStub(channel).UpdatePassword(
+        api.UpdateUserPasswordRequest(user_id=user_id, password=ADMIN_PASSWORD), metadata=auth)
+    print(f"[provision] rotated {ADMIN_EMAIL}'s seeded password to CHIRPSTACK_ADMIN_PASSWORD", flush=True)
+
+
 def connect_and_login():
     """ChirpStack seeds the admin user during its first-boot migrations and the
     gRPC server needs to be listening. Retry login until both are ready.
-    Returns (channel, internal_stub, auth_metadata)."""
+
+    When CHIRPSTACK_ADMIN_PASSWORD differs from the seeded password
+    (CHIRPSTACK_ADMIN_INITIAL_PASSWORD, "admin" by default), the seeded one is
+    rotated away: a login that ChirpStack refuses with the configured password
+    is tried with the seeded one, and when that is accepted the admin's password
+    is set to the configured one and the login repeated with it. Every later run
+    logs in with the configured password at once, and a ChirpStack still on the
+    seeded password (provisioned before one was configured) converges on the next
+    run. Neither password is ever printed. Returns (channel, internal_stub,
+    auth_metadata)."""
     channel = grpc.insecure_channel(GRPC_TARGET)
     internal = api.InternalServiceStub(channel)
+    rotate = ADMIN_PASSWORD != ADMIN_INITIAL_PASSWORD
     last = None
     for attempt in range(1, LOGIN_RETRIES + 1):
         try:
-            resp = internal.Login(api.LoginRequest(email=ADMIN_EMAIL, password=ADMIN_PASSWORD))
-            if resp.jwt:
+            jwt = login(internal, ADMIN_PASSWORD)
+            if jwt is None and rotate:
+                seeded = login(internal, ADMIN_INITIAL_PASSWORD)
+                if seeded:
+                    rotate_initial_password(channel, internal, seeded)
+                    jwt = login(internal, ADMIN_PASSWORD)
+            if jwt:
                 print(f"[provision] logged in as {ADMIN_EMAIL} over gRPC (attempt {attempt})", flush=True)
-                return channel, internal, [("authorization", f"Bearer {resp.jwt}")]
-            last = "login returned no jwt"
+                return channel, internal, [("authorization", f"Bearer {jwt}")]
+            if jwt is None:
+                last = "ChirpStack refused CHIRPSTACK_ADMIN_PASSWORD" + (" and the seeded password" if rotate else "")
+            else:
+                last = "login returned no jwt"
         except grpc.RpcError as err:
             last = f"{err.code()}: {err.details()}"
         print(f"[provision] waiting for ChirpStack gRPC… ({attempt}/{LOGIN_RETRIES}: {last})", flush=True)

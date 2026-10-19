@@ -181,6 +181,15 @@ writes to the shared `shared` volume:
 Re-running `docker compose up` is idempotent: the existing tenant is reused, and the API key is
 reused from `config.json` rather than re-minted. Resetting the `shared` volume forces a new key.
 
+The provisioner logs in as `CHIRPSTACK_ADMIN_EMAIL` with `CHIRPSTACK_ADMIN_PASSWORD`. ChirpStack seeds
+its admin with `admin` on first boot (`CHIRPSTACK_ADMIN_INITIAL_PASSWORD` names another seed). When
+`CHIRPSTACK_ADMIN_PASSWORD` is anything else, the provisioner rotates the seeded password away: a
+login refused with the configured password is tried once with the seeded one, and if that is
+accepted the admin's password is set to the configured one and the login repeated with it. Later
+runs log in with the configured password at once, and a ChirpStack still on `admin` (provisioned
+before a password was set) converges on the next `docker compose up`. The UI login is then the
+configured password; changing it in the UI instead leaves the provisioner unable to log in.
+
 ## Data flow
 
 ```
@@ -1184,7 +1193,8 @@ Notes:
 
 ## Security posture
 
-Bench defaults only: anonymous MQTT, ChirpStack `admin`/`admin`, placeholder `CHIRPSTACK_API_SECRET`,
+Bench defaults only: anonymous MQTT, ChirpStack `admin`/`admin` (set `CHIRPSTACK_ADMIN_PASSWORD` and the
+provisioner rotates it away), placeholder `CHIRPSTACK_API_SECRET`,
 placeholder Postgres passwords (`EVENTS_POSTGRES_PASSWORD`, `EVENTS_POSTGRES_API_PASSWORD`,
 `POSTGRES_LEADSMAN_PASSWORD`), loopback-bound event API/DB. Rotate the secrets, add MQTT auth + TLS,
 and lock down origins/binds before exposing any of this beyond a trusted private network.
