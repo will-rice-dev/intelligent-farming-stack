@@ -1,30 +1,37 @@
 {
   "organizations": [
     {
-      "organization_id": "0198f3c1-7a40-7000-8000-000000000001",
-      "name": "Intelligent Farming Bench",
+      "organization_id": "0198f00d-0000-7000-8000-000200000001",
+      "parent_organization_id": null,
+      "name": "FACT Demo Holdings",
+      "status": "active"
+    },
+    {
+      "organization_id": "0198f00d-0000-7000-8000-000200000002",
+      "parent_organization_id": "0198f00d-0000-7000-8000-000200000001",
+      "name": "North Valley Farms",
       "status": "active"
     }
   ],
   "properties": [
     {
-      "property_id": "0198f3c1-7a40-7000-8000-000000000101",
-      "organization_id": "0198f3c1-7a40-7000-8000-000000000001",
-      "name": "Bench Field",
+      "property_id": "0198f00d-0000-7000-8000-000700000001",
+      "organization_id": "0198f00d-0000-7000-8000-000200000002",
+      "name": "Riverbend Block",
       "status": "active",
-      "timezone": "America/Chicago",
-      "lat": 41.8,
-      "lon": -93.1
+      "timezone": "America/Los_Angeles",
+      "lat": 38.304,
+      "lon": -122.315
     },
     {
-      "property_id": "0198f3c1-7a40-7000-8000-000000000102",
-      "organization_id": "0198f3c1-7a40-7000-8000-000000000001",
-      "name": "Bench South Field",
+      "property_id": "0198f00d-0000-7000-8000-000700000002",
+      "organization_id": "0198f00d-0000-7000-8000-000200000002",
+      "name": "Hillside Block",
       "status": "active",
-      "timezone": "America/Chicago",
-      "lat": 41.7,
-      "lon": -93.2
+      "timezone": "America/Los_Angeles",
+      "lat": 38.3135,
+      "lon": -122.3255
     }
   ],
-  "default_property_id": "0198f3c1-7a40-7000-8000-000000000101"
+  "default_property_id": "0198f00d-0000-7000-8000-000700000001"
 }

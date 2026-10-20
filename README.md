@@ -887,13 +887,24 @@ seeding: `FARM_BRIDGE_PROPERTY_ID` is left blank in `.env` and derived from this
 `default_property_id`, so the property the seeder writes and the property the bridge uses cannot
 drift apart. Point at a real property by editing this file, not by pasting a UUID in two places.
 
-It seeds **two** properties — Bench Field, which is the default every uncurated device lands on, and
-Bench South Field, which exists so there is somewhere to move a device *to*. That is not decoration:
+It seeds **two** properties — Riverbend Block, which is the default every uncurated device lands on,
+and Hillside Block, which exists so there is somewhere to move a device *to*. That is not decoration:
 with one property seeded, "every reading is stamped with the property valid when it was measured" has
 only one answer it could possibly give, and the end-to-end script's placement steps would be
 asserting nothing. Adding a property is an addition to `properties[]` and nothing else — the seeder
 upserts on every `up`, and leaving `default_property_id` alone keeps the bridge's derivation and
 every existing assertion unchanged.
+
+The ids are not invented. They are the development data of the system of record these projections
+are synced down from — FACT Demo Holdings, its North Valley Farms, and that farm's two blocks — so a
+control plane that checks a placement against that system (the property must belong to the farm's
+organization or one beneath it) accepts the assign a bench device is given, rather than refusing a
+property that system has never heard of.
+
+Changing `default_property_id` on a kept bench is not an addition. The seeder upserts and never
+deletes, and every device already placed keeps the window it was auto-placed in, so the bench goes on
+stamping their readings with the old default — which the end-to-end script's "off the default"
+sweep then counts as readings no person placed. Start over (`down -v`) after changing it.
 
 The ChirpStack API key the inventory reconciler uses is read from `/shared/config.json` — minted by
 the provisioner at run time, so no environment variable can carry it. That is the same file
