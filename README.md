@@ -974,6 +974,15 @@ unscheduled at startup, and repeats it in every ingest report. The full reasonin
 for a `degraded` answer, are in the telemetry-bridge repo's README under "Partitioning and
 retention".
 
+### Releases: the farm stack's image list
+
+Each release of this repository publishes the two images built here
+(`ghcr.io/intelligent-farming/stack-provisioner` and `ghcr.io/intelligent-farming/farmdata-api`)
+and attaches `farm-stack-images.json`: every image a farm box runs, pinned by digest, with the
+environment each one needs. Something that installs the farm stack outside this bench pins that file
+rather than this compose file. [docs/farm-stack-images.md](docs/farm-stack-images.md) describes its
+shape, how to pin and verify it, and how to cut a release.
+
 ## Region / sub-band
 
 The active band is a single flag, **`REGION`** in `.env` (default `us915_0` — US915 channels 0-7).

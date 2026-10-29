@@ -1,0 +1,401 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Intelligent Farming Foundation
+#
+# Publishes a release of the stack: the two images built from this repository,
+# then the farm stack's image list, farm-stack-images.json, attached to the
+# release.
+#
+#   provisioning/  -> ghcr.io/intelligent-farming/stack-provisioner
+#   farm-api/      -> ghcr.io/intelligent-farming/farmdata-api
+#
+# The list names every image a farm box runs, with its digest, the platforms it
+# is published for and the environment it needs (docs/farm-stack-images.md). The
+# bridge's three images are not built here: the telemetry-bridge repository
+# publishes them on its own releases, and the list resolves the version
+# release/farm-stack-images.in.json pins. Upstream images are resolved from the
+# tags docker-compose.yml runs.
+#
+# Trigger: a release published for a tag vX.Y.Z or vX.Y.Z-<pre>. Not also
+# `push: tags`, because publishing a release creates its tag and both would
+# fire for one release, racing to push the same images and attach the same
+# file. workflow_dispatch publishes an existing release again -- after a
+# registry outage, say, or a bridge release that landed late -- without
+# cutting a new one.
+#
+# Order: check (the list's source against docker-compose.yml, no registry)
+# -> images (build, smoke test, push, attest) -> image-list (resolve every
+# digest, render, attest, attach). The list is written last, so a release
+# carrying one has every image on it published.
+#
+# Forks do not publish: every job is skipped outside the Foundation's
+# repository, because the list names the Foundation's registry paths.
+#
+# One-time steps for an org owner, before the list can be consumed:
+#   - GHCR packages start private, even for a public repository. After the
+#     first run, set stack-provisioner and farmdata-api to public, or nobody
+#     outside the org can pull them.
+#   - The telemetry bridge's images at the version the source pins must be
+#     published and public, or image-list fails naming each missing one.
+
+name: Publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: An existing release tag to publish again, e.g. v0.5.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  PROVISIONER_IMAGE: ghcr.io/intelligent-farming/stack-provisioner
+  FARMDATA_API_IMAGE: ghcr.io/intelligent-farming/farmdata-api
+
+jobs:
+  check:
+    name: Check the image list's source
+    if: github.repository == 'intelligent-farming/intelligent-farming-stack'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      - name: Derive the version from the tag
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
+            echo "::error::release tag '$TAG' is not vX.Y.Z or vX.Y.Z-<pre>"
+            exit 1
+          fi
+          echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Fails when a service was added to the stack without deciding whether a
+      # farm box runs it, when an upstream tag here and in docker-compose.yml
+      # differ, or when the environment the bench sets and the list names have
+      # drifted apart -- before anything is pushed.
+      - name: The source agrees with docker-compose.yml
+        run: python3 scripts/farm-stack-images.py --check-only
+
+  images:
+    name: Build, smoke test and push the images built here
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # A signed provenance attestation per image, so a consumer can verify
+      # which workflow and commit produced it.
+      attestations: write
+      id-token: write
+    outputs:
+      provisioner-digest: ${{ steps.provisioner-push.outputs.digest }}
+      farmdata-api-digest: ${{ steps.farmdata-api-push.outputs.digest }}
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      COMMIT: ${{ needs.check.outputs.commit }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      # The arm64 leg is the one a Pi-class farm box pulls.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── stack-provisioner ────────────────────────────────────────────────────
+
+      - name: Tags and labels (stack-provisioner)
+        id: provisioner-meta
+        uses: docker/metadata-action@v6
+        env:
+          # Annotate the index too: `docker buildx imagetools inspect` and most
+          # registry pages read the index, not the per-platform manifests.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index,manifest
+        with:
+          images: ${{ env.PROVISIONER_IMAGE }}
+          # The release version and its minor line. No `latest`: the image list
+          # pins digests, and nothing should float.
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
+          labels: |
+            org.opencontainers.image.title=stack-provisioner
+            org.opencontainers.image.description=One-shot ChirpStack provisioner for the Intelligent Farming stack
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.vendor=Intelligent Farming Foundation
+            org.opencontainers.image.revision=${{ env.COMMIT }}
+          # Stated rather than derived: the action would otherwise fill them
+          # from GitHub's licence detector, which reports plain AGPL-3.0.
+          annotations: |
+            org.opencontainers.image.title=stack-provisioner
+            org.opencontainers.image.description=One-shot ChirpStack provisioner for the Intelligent Farming stack
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.vendor=Intelligent Farming Foundation
+            org.opencontainers.image.revision=${{ env.COMMIT }}
+
+      - name: Build stack-provisioner for the smoke test (amd64, loaded)
+        uses: docker/build-push-action@v7
+        with:
+          context: provisioning
+          platforms: linux/amd64
+          load: true
+          tags: stack-provisioner:smoke
+          cache-from: type=gha,scope=stack-provisioner
+          cache-to: type=gha,mode=max,scope=stack-provisioner
+
+      # Capture first, match second: never `docker run ... | grep -q`, whose
+      # early exit hands the docker CLI an EPIPE that pipefail reports as the
+      # step failing.
+      - name: Smoke test stack-provisioner
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint python stack-provisioner:smoke -m py_compile provision.py
+          docker run --rm --entrypoint python stack-provisioner:smoke -c \
+            'import importlib.metadata as m, grpc; from chirpstack_api import api; print("chirpstack-api", m.version("chirpstack-api"), "grpcio", m.version("grpcio"))'
+          # With nothing listening it has to fail, and say so, rather than hang
+          # or exit 0: that is the entrypoint, the gRPC stubs and the retry
+          # loop all present in the image.
+          if out=$(docker run --rm -e CHIRPSTACK_GRPC=127.0.0.1:9 -e LOGIN_RETRIES=1 stack-provisioner:smoke 2>&1); then
+            echo "::error::the provisioner exited 0 with no ChirpStack to provision"; echo "$out"; exit 1
+          fi
+          grep -q 'could not log in after 1 attempts' <<<"$out" \
+            || { echo "::error::the provisioner failed for another reason:"; echo "$out"; exit 1; }
+          echo "smoke: ok"
+
+      - name: Build and push stack-provisioner (amd64, arm64)
+        id: provisioner-push
+        uses: docker/build-push-action@v7
+        with:
+          context: provisioning
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.provisioner-meta.outputs.tags }}
+          labels: ${{ steps.provisioner-meta.outputs.labels }}
+          annotations: ${{ steps.provisioner-meta.outputs.annotations }}
+          cache-from: type=gha,scope=stack-provisioner
+          cache-to: type=gha,mode=max,scope=stack-provisioner
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest stack-provisioner
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.PROVISIONER_IMAGE }}
+          subject-digest: ${{ steps.provisioner-push.outputs.digest }}
+          push-to-registry: true
+
+      # ── farmdata-api ─────────────────────────────────────────────────────────
+
+      - name: Tags and labels (farmdata-api)
+        id: farmdata-api-meta
+        uses: docker/metadata-action@v6
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index,manifest
+        with:
+          images: ${{ env.FARMDATA_API_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
+          labels: |
+            org.opencontainers.image.title=farmdata-api
+            org.opencontainers.image.description=Read-only GraphQL over the farmdata telemetry store
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.vendor=Intelligent Farming Foundation
+            org.opencontainers.image.revision=${{ env.COMMIT }}
+          annotations: |
+            org.opencontainers.image.title=farmdata-api
+            org.opencontainers.image.description=Read-only GraphQL over the farmdata telemetry store
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.vendor=Intelligent Farming Foundation
+            org.opencontainers.image.revision=${{ env.COMMIT }}
+
+      - name: Build farmdata-api for the smoke test (amd64, loaded)
+        uses: docker/build-push-action@v7
+        with:
+          context: farm-api
+          platforms: linux/amd64
+          load: true
+          tags: farmdata-api:smoke
+          cache-from: type=gha,scope=farmdata-api
+          cache-to: type=gha,mode=max,scope=farmdata-api
+
+      # It is a network service, so the published image has to carry AGPL
+      # section 13's offer of source: a header on every response and a document
+      # at /source. Both are served before the database is reachable
+      # (PostGraphile retries its introspection in the background), so this
+      # needs no database.
+      - name: Smoke test farmdata-api
+        run: |
+          set -euo pipefail
+          if out=$(docker run --rm farmdata-api:smoke 2>&1); then
+            echo "::error::farmdata-api started with no database settings"; echo "$out"; exit 1
+          fi
+          grep -q 'PGHOST, PGUSER, PGDATABASE not set' <<<"$out" \
+            || { echo "::error::farmdata-api failed for another reason:"; echo "$out"; exit 1; }
+          docker run -d --name farmdata-api-smoke -p 127.0.0.1:5000:5000 \
+            -e PGHOST=127.0.0.1 -e PGUSER=smoke -e PGDATABASE=smoke farmdata-api:smoke >/dev/null
+          trap 'docker rm -f farmdata-api-smoke >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 30); do
+            if headers=$(curl -fsS -D - -o body.json http://127.0.0.1:5000/source 2>/dev/null); then break; fi
+            sleep 1
+          done
+          [ -n "${headers:-}" ] || { echo "::error::farmdata-api never answered /source"; docker logs farmdata-api-smoke; exit 1; }
+          grep -qi '^x-license: AGPL-3.0-or-later' <<<"$headers" \
+            || { echo "::error::no x-license header:"; echo "$headers"; exit 1; }
+          grep -q 'github.com/intelligent-farming/intelligent-farming-stack' body.json \
+            || { echo "::error::/source does not offer this repository:"; cat body.json; exit 1; }
+          echo "smoke: ok"
+
+      - name: Build and push farmdata-api (amd64, arm64)
+        id: farmdata-api-push
+        uses: docker/build-push-action@v7
+        with:
+          context: farm-api
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.farmdata-api-meta.outputs.tags }}
+          labels: ${{ steps.farmdata-api-meta.outputs.labels }}
+          annotations: ${{ steps.farmdata-api-meta.outputs.annotations }}
+          cache-from: type=gha,scope=farmdata-api
+          cache-to: type=gha,mode=max,scope=farmdata-api
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest farmdata-api
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.FARMDATA_API_IMAGE }}
+          subject-digest: ${{ steps.farmdata-api-push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summarise
+        env:
+          PROVISIONER_DIGEST: ${{ steps.provisioner-push.outputs.digest }}
+          FARMDATA_API_DIGEST: ${{ steps.farmdata-api-push.outputs.digest }}
+        run: |
+          {
+            echo "### Images ($TAG)"
+            echo
+            echo '```'
+            echo "$PROVISIONER_IMAGE:$VERSION@$PROVISIONER_DIGEST"
+            echo "$FARMDATA_API_IMAGE:$VERSION@$FARMDATA_API_DIGEST"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  image-list:
+    name: Render and attach farm-stack-images.json
+    needs: [check, images]
+    runs-on: ubuntu-latest
+    permissions:
+      # Attaching the list to the release.
+      contents: write
+      # Resolving ghcr.io digests, the bridge's included.
+      packages: read
+      attestations: write
+      id-token: write
+    outputs:
+      sha256: ${{ steps.render.outputs.sha256 }}
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      COMMIT: ${{ needs.check.outputs.commit }}
+      PROVISIONER_DIGEST: ${{ needs.images.outputs.provisioner-digest }}
+      FARMDATA_API_DIGEST: ${{ needs.images.outputs.farmdata-api-digest }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Every digest is resolved here, from the registry: the two just pushed
+      # (and checked to exist), the bridge's at the version the source pins,
+      # and the upstream images at the tags the bench runs -- ChirpStack's
+      # against the digest the source pins, failing if the tag has moved.
+      # Every image must be published for linux/amd64 and linux/arm64.
+      - name: Render the list
+        id: render
+        run: |
+          set -euo pipefail
+          python3 scripts/farm-stack-images.py \
+            --version "$VERSION" \
+            --digest "provisioner=$PROVISIONER_DIGEST" \
+            --digest "farmdata-api=$FARMDATA_API_DIGEST" \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --source-ref "refs/tags/$TAG" \
+            --source-commit "$COMMIT" \
+            --output farm-stack-images.json
+          sha256sum farm-stack-images.json > farm-stack-images.json.sha256
+          echo "sha256=$(cut -d' ' -f1 farm-stack-images.json.sha256)" >> "$GITHUB_OUTPUT"
+
+      # `gh attestation verify farm-stack-images.json --repo
+      # intelligent-farming/intelligent-farming-stack` then proves this workflow,
+      # at this commit, wrote the file a consumer pinned.
+      - name: Attest the list
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: farm-stack-images.json
+
+      - name: Keep the list with the run
+        uses: actions/upload-artifact@v7
+        with:
+          name: farm-stack-images
+          path: |
+            farm-stack-images.json
+            farm-stack-images.json.sha256
+
+      - name: Attach the list to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" farm-stack-images.json farm-stack-images.json.sha256 --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Summarise
+        env:
+          SHA256: ${{ steps.render.outputs.sha256 }}
+        run: |
+          {
+            echo "### farm-stack-images.json ($TAG)"
+            echo
+            echo "sha256: \`$SHA256\`"
+            echo
+            echo '| image | reference | digest |'
+            echo '|---|---|---|'
+            # shellcheck disable=SC2016 # the backticks are Markdown, not a substitution
+            python3 -c 'import json; [print("| %s | %s:%s | `%s` |" % (i["name"], i["image"]["name"], i["image"]["tag"], i["image"]["digest"])) for i in json.load(open("farm-stack-images.json"))["images"]]'
+          } >> "$GITHUB_STEP_SUMMARY"

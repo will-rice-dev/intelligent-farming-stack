@@ -1,0 +1,196 @@
+{
+  "$comment": "The source of the farm stack's image list: every image a farm box runs, the registry reference it is published under, and the environment it needs. .github/workflows/publish.yml renders it into farm-stack-images.json on every release, filling each digest; scripts/farm-stack-images.py does the rendering and fails when this file and docker-compose.yml disagree. docs/farm-stack-images.md describes both. SPDX-License-Identifier: AGPL-3.0-or-later. Copyright (C) 2026 Intelligent Farming Foundation.",
+  "contract": "intelligent-farming/farm-stack-images",
+  "schemaVersion": 1,
+  "requiredPlatforms": ["linux/amd64", "linux/arm64"],
+  "benchOnly": [
+    "leftenant",
+    "events-postgres",
+    "events-schema-wait",
+    "events-api",
+    "leadsman-migrate",
+    "leadsman"
+  ],
+  "images": [
+    {
+      "name": "chirpstack-postgres",
+      "description": "PostgreSQL for ChirpStack",
+      "publisher": "upstream",
+      "services": ["chirpstack-postgres"],
+      "image": { "name": "docker.io/library/postgres", "tag": "14-alpine" },
+      "env": {
+        "POSTGRES_USER": { "required": true, "value": "chirpstack", "description": "ChirpStack's database owner." },
+        "POSTGRES_PASSWORD": { "required": true, "secret": true, "description": "That owner's password. The bench's chirpstack/chirpstack.toml writes the literal `chirpstack` into its DSN; anything real supplies a generated one to both." },
+        "POSTGRES_DB": { "required": true, "value": "chirpstack", "description": "ChirpStack's database." }
+      }
+    },
+    {
+      "name": "redis",
+      "description": "Redis for ChirpStack",
+      "publisher": "upstream",
+      "services": ["redis"],
+      "image": { "name": "docker.io/library/redis", "tag": "7-alpine" },
+      "env": {}
+    },
+    {
+      "name": "mosquitto",
+      "description": "MQTT broker: ChirpStack, the gateway bridges and the telemetry bridge meet here",
+      "publisher": "upstream",
+      "services": ["mosquitto"],
+      "image": { "name": "docker.io/library/eclipse-mosquitto", "tag": "2" },
+      "env": {}
+    },
+    {
+      "name": "chirpstack",
+      "description": "ChirpStack network server",
+      "publisher": "upstream",
+      "services": ["chirpstack"],
+      "image": {
+        "name": "docker.io/chirpstack/chirpstack",
+        "tag": "4.19.2",
+        "digest": "sha256:cecb45bd2dfc9de55d32c620d6674093f859a899f4de36eb82924c7aa3bda8de"
+      },
+      "env": {
+        "POSTGRESQL_HOST": { "required": true, "value": "chirpstack-postgres", "description": "Interpolated by the stack's chirpstack/chirpstack.toml, not read by the image itself; the same holds for every variable here." },
+        "REDIS_HOST": { "required": true, "value": "redis", "description": "Redis host." },
+        "MQTT_BROKER_HOST": { "required": true, "value": "mosquitto", "description": "Broker host, for the MQTT integration and the region's gateway backend." },
+        "API_SECRET": { "required": true, "secret": true, "description": "Signs ChirpStack's API tokens. The bench ships a placeholder; rotate it for anything reachable." },
+        "REGION": { "required": true, "value": "us915_0", "description": "The enabled region: us915_0 or us915_1. Must equal the gateway bridges' topic prefix." }
+      },
+      "benchOnlyEnv": [
+        "EVENTS_POSTGRESQL_HOST",
+        "EVENTS_POSTGRESQL_USER",
+        "EVENTS_POSTGRESQL_PASSWORD",
+        "EVENTS_POSTGRESQL_DB"
+      ]
+    },
+    {
+      "name": "chirpstack-rest-api",
+      "description": "ChirpStack's REST gateway: the provisioner's codec attach, the bridge's reconciler and the box's agent go through it",
+      "publisher": "upstream",
+      "services": ["chirpstack-rest-api"],
+      "image": { "name": "docker.io/chirpstack/chirpstack-rest-api", "tag": "4" },
+      "env": {}
+    },
+    {
+      "name": "chirpstack-gateway-bridge",
+      "description": "Gateway bridge, run twice: Semtech UDP (1700/udp) and BasicStation (3001/tcp)",
+      "publisher": "upstream",
+      "services": ["chirpstack-gateway-bridge", "chirpstack-gateway-bridge-basicstation"],
+      "image": { "name": "docker.io/chirpstack/chirpstack-gateway-bridge", "tag": "4" },
+      "env": {
+        "INTEGRATION__MQTT__EVENT_TOPIC_TEMPLATE": { "required": true, "value": "us915_0/gateway/{{ .GatewayID }}/event/{{ .EventType }}", "description": "The first path segment is the region and must equal ChirpStack's REGION." },
+        "INTEGRATION__MQTT__STATE_TOPIC_TEMPLATE": { "required": true, "value": "us915_0/gateway/{{ .GatewayID }}/state/{{ .StateType }}", "description": "As above." },
+        "INTEGRATION__MQTT__COMMAND_TOPIC_TEMPLATE": { "required": true, "value": "us915_0/gateway/{{ .GatewayID }}/command/#", "description": "As above." }
+      }
+    },
+    {
+      "name": "provisioner",
+      "description": "One-shot: rotates ChirpStack's seeded admin password to the configured one, ensures the tenant and its API key, and writes them to SHARED_DIR",
+      "publisher": "intelligent-farming-stack",
+      "services": ["provisioner"],
+      "build": { "context": "provisioning" },
+      "image": { "name": "ghcr.io/intelligent-farming/stack-provisioner" },
+      "oneshot": true,
+      "env": {
+        "CHIRPSTACK_GRPC": { "required": false, "value": "chirpstack:8080", "description": "ChirpStack's gRPC API: login, tenant and API key." },
+        "CHIRPSTACK_REST_URL": { "required": false, "value": "http://chirpstack-rest-api:8090", "description": "REST gateway, for the optional codec attach." },
+        "CHIRPSTACK_ADMIN_EMAIL": { "required": false, "value": "admin", "description": "The bootstrap admin ChirpStack seeds." },
+        "CHIRPSTACK_ADMIN_PASSWORD": { "required": true, "secret": true, "description": "The admin's password. When it differs from CHIRPSTACK_ADMIN_INITIAL_PASSWORD, the seeded one is rotated to it on the first run. Its default, admin, is a placeholder: left unset, ChirpStack keeps a global admin anyone who reaches it can log in as." },
+        "CHIRPSTACK_ADMIN_INITIAL_PASSWORD": { "required": false, "description": "The password ChirpStack seeds its admin with; default admin." },
+        "TENANT_NAME": { "required": false, "description": "The tenant to ensure; default Intelligent Farming." },
+        "API_KEY_NAME": { "required": false, "description": "The tenant API key's name; default intelligent-farming-stack." },
+        "LEFTENANT_CHIRPSTACK_URL": { "required": false, "description": "Browser-facing REST URL written into config.json for Leftenant; default http://localhost:8090." },
+        "LEFTENANT_MQTT_URL": { "required": false, "description": "Browser-facing MQTT-over-WebSocket URL written into config.json; default ws://localhost:9001." },
+        "LEFTENANT_GATEWAY_BRIDGE_HOST": { "required": false, "description": "Host a physical gateway forwards to, written into config.json; defaults to LEFTENANT_CHIRPSTACK_URL's host." },
+        "SHARED_DIR": { "required": false, "description": "Where the outputs go; default /shared. config.json there carries apiKey and tenantId, which the telemetry bridge needs." },
+        "CODECS_DIR": { "required": false, "description": "Codec .js files to attach, if any; default /codecs. Absent or empty is a no-op." },
+        "LOGIN_RETRIES": { "required": false, "description": "Login attempts while ChirpStack comes up, two seconds apart; default 60." }
+      }
+    },
+    {
+      "name": "farm-postgres",
+      "description": "PostgreSQL 18 with pg_partman and PostGIS: the farmdata store",
+      "publisher": "telemetry-bridge",
+      "services": ["farm-postgres"],
+      "image": { "name": "ghcr.io/intelligent-farming/farm-postgres", "tag": "0.1.1" },
+      "env": {
+        "POSTGRES_USER": { "required": true, "value": "farmdata_owner", "description": "The owning superuser: CREATE EXTENSION pg_partman needs one. Services connect as the logins farmdata-migrate mints, never as this." },
+        "POSTGRES_PASSWORD": { "required": true, "secret": true, "description": "The owner's password." },
+        "POSTGRES_DB": { "required": true, "value": "farmdata", "description": "The farmdata database." },
+        "POSTGRES_INITDB_ARGS": { "required": true, "value": "--encoding=UTF8 --locale-provider=builtin --builtin-locale=C.UTF-8 --lc-collate=C --lc-ctype=C", "description": "Read once, at first boot. The builtin locale provider ties collation to the server version rather than the image's libc." }
+      }
+    },
+    {
+      "name": "farmdata-migrate",
+      "description": "One-shot: the farmdata migration chain, the login users, the projection seed",
+      "publisher": "telemetry-bridge",
+      "services": ["farmdata-migrate"],
+      "image": { "name": "ghcr.io/intelligent-farming/farmdata-migrate", "tag": "0.1.1" },
+      "oneshot": true,
+      "env": {
+        "FARM_POSTGRES_HOST_BIND": { "required": true, "value": "farm-postgres", "description": "The database host, as the client sees it." },
+        "FARM_POSTGRES_HOST_PORT": { "required": true, "value": "5432", "description": "The database port, as the client sees it." },
+        "FARM_POSTGRES_USER": { "required": true, "value": "farmdata_owner", "description": "The owner: the chain creates extensions." },
+        "FARM_POSTGRES_PASSWORD": { "required": true, "secret": true, "description": "The owner's password." },
+        "FARM_POSTGRES_DB": { "required": true, "value": "farmdata", "description": "The farmdata database." },
+        "FARM_BRIDGE_LOGIN_USER": { "required": true, "value": "farmdata_bridge", "description": "The login minted for the bridge (member of bridge_writer)." },
+        "FARM_BRIDGE_LOGIN_PASSWORD": { "required": true, "secret": true, "description": "Its password." },
+        "FARM_API_LOGIN_USER": { "required": true, "value": "farmdata_api", "description": "The login minted for farmdata-api (member of farm_read)." },
+        "FARM_API_LOGIN_PASSWORD": { "required": true, "secret": true, "description": "Its password." },
+        "FARM_BRIDGE_MAINT_LOGIN_USER": { "required": true, "value": "farmdata_maint", "description": "The login minted for partition maintenance (member of partman_maintainer)." },
+        "FARM_BRIDGE_MAINT_LOGIN_PASSWORD": { "required": true, "secret": true, "description": "Its password." },
+        "FARM_PROJECTION_SEED": { "required": true, "value": "/seed/projection.json", "description": "A path inside the container: the organization and property projection seed, mounted there." }
+      }
+    },
+    {
+      "name": "telemetry-bridge",
+      "description": "The telemetry bridge daemon: MQTT consumer, inventory reconciler, curation API",
+      "publisher": "telemetry-bridge",
+      "services": ["telemetry-bridge"],
+      "image": { "name": "ghcr.io/intelligent-farming/telemetry-bridge", "tag": "0.1.1" },
+      "env": {
+        "FARM_BRIDGE_MQTT_URL": { "required": true, "value": "mqtt://mosquitto:1883", "description": "The broker. The daemon's own default is a development address." },
+        "FARM_BRIDGE_CLIENT_ID": { "required": false, "value": "telemetry-bridge", "description": "Its persistent MQTT session's client id. One daemon per broker." },
+        "FARM_BRIDGE_SIGNAL_HEALTH": { "required": false, "value": "on", "description": "on or off." },
+        "FARM_POSTGRES_HOST_BIND": { "required": true, "value": "farm-postgres", "description": "The database host, as the client sees it." },
+        "FARM_POSTGRES_HOST_PORT": { "required": true, "value": "5432", "description": "The database port, as the client sees it." },
+        "FARM_POSTGRES_USER": { "required": true, "value": "farmdata_bridge", "description": "The minted bridge login, never the owner." },
+        "FARM_POSTGRES_PASSWORD": { "required": true, "secret": true, "description": "Its password." },
+        "FARM_POSTGRES_DB": { "required": true, "value": "farmdata", "description": "The farmdata database." },
+        "FARM_BRIDGE_PROPERTY_ID": { "required": true, "from": "the projection seed's default_property_id", "description": "The property an unplaced device lands on. No default. The bench's farm/bridge-entrypoint.sh derives it at start." },
+        "FARM_BRIDGE_CHIRPSTACK_URL": { "required": true, "value": "http://chirpstack-rest-api:8090", "description": "The REST gateway, for the inventory reconciler. URL, key and tenant are all set or all unset." },
+        "FARM_BRIDGE_CHIRPSTACK_API_KEY": { "required": true, "secret": true, "from": "the provisioner's SHARED_DIR/config.json, field apiKey", "description": "The tenant API key the provisioner minted. The bench's farm/bridge-entrypoint.sh reads it at start." },
+        "FARM_BRIDGE_CHIRPSTACK_TENANT_ID": { "required": true, "from": "the provisioner's SHARED_DIR/config.json, field tenantId", "description": "The tenant the provisioner ensured. Read at start like the key." },
+        "FARM_BRIDGE_RECONCILE_INTERVAL_SECONDS": { "required": false, "description": "Reconciler period." },
+        "FARM_BRIDGE_CHIRPSTACK_TIMEOUT_SECONDS": { "required": false, "description": "Per-request bound on the REST gateway." },
+        "FARM_BRIDGE_CURATION_API": { "required": true, "value": "on", "description": "The farm-local curation API. Off in the daemon's own default; the stack turns it on. It writes and has no authentication: publish its port on loopback only." },
+        "FARM_BRIDGE_CURATION_BIND": { "required": true, "value": "0.0.0.0", "description": "Inside the container; the published port decides who reaches it." },
+        "FARM_BRIDGE_CURATION_PORT": { "required": true, "value": "8091", "description": "The container port." },
+        "FARM_BRIDGE_CURATION_LAG_DAYS": { "required": false, "description": "Curation-lag alarm threshold." },
+        "FARM_BRIDGE_CURATION_CHECK_INTERVAL_SECONDS": { "required": false, "description": "How often the lag is checked." },
+        "FARM_BRIDGE_REPORT_INTERVAL_SECONDS": { "required": false, "description": "How often the ingest counters are logged." },
+        "FARM_BRIDGE_MAINT_LOGIN_USER": { "required": true, "value": "farmdata_maint", "description": "The minted maintenance login. Left unset the daemon runs with partition maintenance unscheduled, which the stack treats as a fault." },
+        "FARM_BRIDGE_MAINT_LOGIN_PASSWORD": { "required": true, "secret": true, "description": "Its password." },
+        "FARM_BRIDGE_MAINTAIN_INTERVAL_SECONDS": { "required": false, "description": "Partition maintenance period." }
+      }
+    },
+    {
+      "name": "farmdata-api",
+      "description": "Optional: read-only GraphQL over farmdata",
+      "publisher": "intelligent-farming-stack",
+      "services": ["farmdata-api"],
+      "build": { "context": "farm-api" },
+      "image": { "name": "ghcr.io/intelligent-farming/farmdata-api" },
+      "optional": true,
+      "env": {
+        "PGHOST": { "required": true, "value": "farm-postgres", "description": "The database host. PGHOST, PGUSER and PGDATABASE are required unless DATABASE_URL is set." },
+        "PGPORT": { "required": false, "value": "5432", "description": "Default 5432." },
+        "PGUSER": { "required": true, "value": "farmdata_api", "description": "The minted read-only login." },
+        "PGPASSWORD": { "required": true, "secret": true, "description": "Its password." },
+        "PGDATABASE": { "required": true, "value": "farmdata", "description": "The farmdata database." },
+        "API_GRAPHIQL": { "required": false, "description": "true serves GraphiQL. The bench turns it on; anything reachable leaves it off." }
+      }
+    }
+  ]
+}
