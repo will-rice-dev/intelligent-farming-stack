@@ -98,9 +98,11 @@ curl -fsSL https://github.com/intelligent-farming/intelligent-farming-stack/arch
 
 Already have the repo on disk? Just run the helper from the repo folder — `./setup.sh --update`
 (or `powershell -ExecutionPolicy Bypass -File .\setup.ps1 -Update`). It rebuilds Leftenant from the
-latest `main` (`docker build --pull <giturl>`), pulls newer ChirpStack/Postgres images, and recreates
-the containers. If you ever suspect a stale Leftenant build, force it with `./setup.sh --rebuild`
-(`-Rebuild`), which adds `--no-cache`.
+latest `main` (`docker build --pull <giturl>`), pulls newer Postgres and gateway-bridge images, and
+recreates the containers. ChirpStack itself is pinned to an exact release in `docker-compose.yml`
+(4.19.2, the release a farm box runs), so an update moves it only when the stack's own pin moves.
+If you ever suspect a stale Leftenant build, force it with `./setup.sh --rebuild` (`-Rebuild`),
+which adds `--no-cache`.
 
 Two things an update deliberately does not touch, both because they are yours:
 

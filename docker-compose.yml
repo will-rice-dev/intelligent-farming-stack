@@ -75,7 +75,14 @@ services:
       start_period: 5s
 
   chirpstack:
-    image: chirpstack/chirpstack:4
+    # An exact release, unlike the `:4` lines of the REST gateway and the
+    # gateway bridges below. 4.19.2 is the ChirpStack release a farm box runs,
+    # pinned there by digest, so the bench proves the release that ships rather
+    # than whatever `:4` resolved to on the day it was pulled -- `:4` moved to
+    # 4.20.0 on 2026-10-20, a release that also adds a database migration. Move
+    # this deliberately and together with what the box pins; `docker compose
+    # pull` and the setup scripts' update leave it where it is.
+    image: chirpstack/chirpstack:4.19.2
     restart: unless-stopped
     command: -c /etc/chirpstack
     volumes:
